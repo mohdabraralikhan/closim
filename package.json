@@ -1,0 +1,19 @@
+{
+  "name": "cloth-engine-v0",
+  "version": "0.1.0",
+  "description": "Physics-first triangular FEM cloth reference engine (CPU). Anisotropic membrane + hinge bending + implicit Euler + Newton/PCG.",
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "vitest run",
+    "strip-pull": "tsx examples/strip-pull.ts",
+    "check": "tsx tests/gradient-check.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.3",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0",
+    "vitest": "^2.1.0",
+    "webgpu": "^0.6.1"
+  }
+}
