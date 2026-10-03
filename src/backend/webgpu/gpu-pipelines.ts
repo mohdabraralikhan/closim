@@ -79,7 +79,7 @@ export const SHADER_ENTRY_POINTS: Record<ShaderName, string[]> = {
   "barrier-hvp": ["barrier_hvp_project", "assemble_barrier_hvp", "contact_diag"],
   "broadphase-aabb": ["main"],
   "broadphase-morton": ["main"],
-  "broadphase-sort": ["bitonic_sort_step", "sort_next", "sort_step_indexed"],
+  "broadphase-sort": ["bitonic_sort_step", "sort_next", "sort_reset", "sort_step_indexed"],
   "broadphase-lbvh": ["lbvh_seed_leaves", "lbvh_build", "lbvh_find_root", "lbvh_refit"],
   "broadphase-traverse": ["traverse"],
   "closest-vt": ["closest_vt"],

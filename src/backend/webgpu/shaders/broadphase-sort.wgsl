@@ -90,11 +90,28 @@ fn sort_next(@builtin(global_invocation_id) gid : vec3u) {
   sortCursor[0] = t + 1u;
 }
 
+// sort_reset: zero the pass cursor (lane 0) ahead of a rebuild. Replaces the
+// CPU writeBuffer reset so the whole sort — and the whole broadphase — stays
+// in one encoder with no control-write flush. Lane 1 carries T (pass count,
+// written once at upload); steps clamp to it so a transient/duplicated step
+// degrades to re-running the last pass (idempotent) instead of an OOB read.
+@compute @workgroup_size(64)
+fn sort_reset(@builtin(global_invocation_id) gid : vec3u) {
+  if (gid.x + gid.y * 4194240u != 0u) { return; }
+  sortCursor[0] = 0u;
+}
+
 @compute @workgroup_size(64)
 fn sort_step_indexed(@builtin(global_invocation_id) gid : vec3u) {
   let i = gid.x + gid.y * 4194240u;
   // The matching sort_next already advanced the cursor past our pass.
-  let t = sortCursor[0] - 1u;
+  // Clamp defensively: a step without its next (only possible via driver
+  // misuse, never in sortPassesIndexed lockstep) re-runs the final pass,
+  // which is idempotent, instead of reading out of bounds.
+  let raw = sortCursor[0] - 1u;
+  let hi = sortCursor[1];
+  var t = raw;
+  if (hi > 0u && raw >= hi) { t = hi - 1u; }
   let prm = sortParams[t];
   compareSwap(i, prm.x, prm.y, prm.z);
 }
