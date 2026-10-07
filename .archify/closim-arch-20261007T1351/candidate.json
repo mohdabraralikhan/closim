@@ -1,0 +1,187 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "Closim — Garment Simulation Engine",
+    "subtitle": "CAD · Physics · Solver · GPU Backend · Production · Commerce",
+    "output": ".archify/closim-arch-20261007T1351/closim.html",
+    "quality_profile": "showcase",
+    "visual_preset": "blueprint"
+  },
+  "layout": { "mode": "grid", "cols": 6, "gapX": 80, "gapY": 64, "cellW": 168, "cellH": 64 },
+  "components": [
+    { "id": "app-main",          "type": "frontend",  "label": "main.ts",                "sublabel": "app entry",                "row": 0, "col": 1 },
+    { "id": "app-renderer",      "type": "frontend",  "label": "renderer.ts",            "sublabel": "WebGL draw loop",          "row": 0, "col": 2 },
+    { "id": "app-dashboard",     "type": "frontend",  "label": "prod-dashboard",         "sublabel": "reporting UI",             "row": 0, "col": 3 },
+    { "id": "ext-threejs",       "type": "external",  "label": "three.js",               "sublabel": "WebGL 3D library",         "row": 0, "col": 4 },
+    { "id": "ext-webgpu",        "type": "external",  "label": "WebGPU API",             "sublabel": "WGSL compute",             "row": 0, "col": 5 },
+
+    { "id": "view-viewport",     "type": "backend",   "label": "GarmentWorkspace",       "sublabel": "design + render state hub","row": 1, "col": 0, "tag": "owns design+sim state" },
+    { "id": "view-sim-session",  "type": "backend",   "label": "SimSession",             "sublabel": "rAF solver loop",          "row": 1, "col": 1 },
+    { "id": "view-camera",       "type": "frontend",  "label": "OrbitCamera",            "sublabel": "pan/zoom/orbit",           "row": 1, "col": 2 },
+    { "id": "view-sync",         "type": "backend",   "label": "sync.ts",                "sublabel": "2D→3D state sync",         "row": 1, "col": 3 },
+    { "id": "render-adapter",    "type": "backend",   "label": "Three.js Adapter",       "sublabel": "mesh + material + scene",  "row": 1, "col": 4 },
+    { "id": "render-package",    "type": "backend",   "label": "render/package.ts",      "sublabel": "screenshots",              "row": 1, "col": 5 },
+
+    { "id": "cad-editor",        "type": "frontend",  "label": "PatternEditor",          "sublabel": "headless 2D CAD",          "row": 2, "col": 0, "tag": "tool/snap/undo" },
+    { "id": "cad-ops",           "type": "backend",   "label": "ops.ts",                 "sublabel": "move/trim/mirror",         "row": 2, "col": 1 },
+    { "id": "cad-history",       "type": "backend",   "label": "CadSession",             "sublabel": "undo/redo stack",          "row": 2, "col": 2 },
+    { "id": "cad-snap",          "type": "backend",   "label": "snap.ts",                "sublabel": "grid/endpoint snap",       "row": 2, "col": 3 },
+    { "id": "cad-dxf",           "type": "backend",   "label": "DXF import/export",      "sublabel": "full-profile round-trip",  "row": 2, "col": 4, "tag": "G13" },
+    { "id": "cad-export",        "type": "backend",   "label": "SVG / PDF export",       "sublabel": "patterns + tech sheets",   "row": 2, "col": 5 },
+
+    { "id": "garment-assembly",  "type": "backend",   "label": "GarmentAssembly",        "sublabel": "pattern → mesh → scene",   "row": 3, "col": 0, "tag": "G8C" },
+    { "id": "garment-sewing",    "type": "backend",   "label": "sewing.ts",              "sublabel": "stitch pair resolver",     "row": 3, "col": 1 },
+    { "id": "garment-avatar",    "type": "backend",   "label": "avatar.ts",              "sublabel": "body → collider mesh",     "row": 3, "col": 2 },
+    { "id": "garment-project",   "type": "backend",   "label": "GarmentProject",         "sublabel": "pattern+seams+material",   "row": 3, "col": 3 },
+    { "id": "proj-store",        "type": "database",  "label": "Project Store",          "sublabel": "JSON serialize/restore",   "row": 3, "col": 4 },
+
+    { "id": "mesh-data",         "type": "database",  "label": "ClothMeshData",          "sublabel": "invDm · masses · hinges",  "row": 4, "col": 0 },
+    { "id": "mesh-incidence",    "type": "backend",   "label": "incidence.ts",           "sublabel": "vertex-triangle adjacency","row": 4, "col": 1 },
+    { "id": "r-adaptive",        "type": "backend",   "label": "r-Adaptive Refine",      "sublabel": "strain-driven refinement", "row": 4, "col": 2, "tag": "G7B" },
+    { "id": "phys-material",     "type": "database",  "label": "ClothMaterial",          "sublabel": "stiffness · density",      "row": 4, "col": 3 },
+    { "id": "phys-scene",        "type": "database",  "label": "ClothScene",             "sublabel": "positions · vel · pins",   "row": 4, "col": 4, "tag": "runtime state" },
+
+    { "id": "phys-fem",          "type": "backend",   "label": "FEM Assembly",           "sublabel": "membrane + hinge energy",  "row": 5, "col": 0 },
+    { "id": "phys-membrane",     "type": "backend",   "label": "Membrane StVK",          "sublabel": "orthotropic per triangle", "row": 5, "col": 1, "tag": "F=Ds·Dm⁻¹" },
+    { "id": "phys-bending",      "type": "backend",   "label": "Hinge Bending",          "sublabel": "dihedral angle energy",    "row": 5, "col": 2 },
+    { "id": "phys-membrane-hvp", "type": "backend",   "label": "Membrane HVP",           "sublabel": "matrix-free Hv=g",         "row": 5, "col": 3 },
+    { "id": "solver-block-jacobi","type": "backend",  "label": "Block-Jacobi",           "sublabel": "3×3 diagonal precond",     "row": 5, "col": 4 },
+    { "id": "solver-schwarz",    "type": "backend",   "label": "Schwarz / MAS",          "sublabel": "additive multi-level",     "row": 5, "col": 5 },
+
+    { "id": "solver-newton",     "type": "backend",   "label": "Newton / Armijo",        "sublabel": "implicit Euler variational","row": 6, "col": 0, "tag": "10 iters · CCD-gated LS" },
+    { "id": "solver-pcg",        "type": "backend",   "label": "Jacobi-PCG",             "sublabel": "60 iters · matrix-free",   "row": 6, "col": 1 },
+    { "id": "solver-block-jacobi","type": "backend",  "label": "Block-Jacobi",           "sublabel": "3×3 diagonal precond",     "row": 6, "col": 2 },
+    { "id": "solver-schwarz",    "type": "backend",   "label": "Schwarz / MAS",          "sublabel": "additive multi-level",     "row": 6, "col": 3 },
+
+    { "id": "coll-contact",      "type": "security",  "label": "ContactSystem",          "sublabel": "frozen-projection lagged", "row": 7, "col": 0, "tag": "barrier+friction variational" },
+    { "id": "coll-broadphase",   "type": "backend",   "label": "BroadPhase",             "sublabel": "BVH self+static overlap",  "row": 7, "col": 1 },
+    { "id": "coll-ccd",          "type": "security",  "label": "CCD (VT + EE)",          "sublabel": "cubic root, gates Armijo", "row": 7, "col": 2 },
+    { "id": "coll-bvh",          "type": "backend",   "label": "TriBvh",                 "sublabel": "AABB BVH traversal",       "row": 7, "col": 3 },
+    { "id": "coll-barrier",      "type": "security",  "label": "IPC Barrier",            "sublabel": "log-barrier b(d), dHat",   "row": 7, "col": 4 },
+    { "id": "coll-friction",     "type": "backend",   "label": "Lagged Coulomb",         "sublabel": "residual-only friction",   "row": 7, "col": 5 },
+
+    { "id": "be-interface",      "type": "backend",   "label": "ClothSolver",            "sublabel": "initialize · step · pin",  "row": 8, "col": 0 },
+    { "id": "be-cpu-solver",     "type": "backend",   "label": "CpuSolver",              "sublabel": "golden reference impl",    "row": 8, "col": 1 },
+    { "id": "be-gpu-solver",     "type": "cloud",     "label": "WebGpuSolver",           "sublabel": "GPU-resident state",       "row": 8, "col": 2, "tag": "CPU control" },
+    { "id": "be-gpu-newton",     "type": "cloud",     "label": "DeviceNewtonDriver",     "sublabel": "GPU Newton orchestrator",  "row": 8, "col": 3 },
+    { "id": "be-gpu-buffers",    "type": "database",  "label": "gpu-buffers.ts",         "sublabel": "SimParams · 64B status",   "row": 8, "col": 4 },
+    { "id": "be-gpu-pipelines",  "type": "cloud",     "label": "WGSL Pipelines",         "sublabel": "shader entry points",      "row": 8, "col": 5 },
+
+    { "id": "grading-engine",    "type": "backend",   "label": "GradingEngine",          "sublabel": "size-run rule propagation","row": 9, "col": 0 },
+    { "id": "grading-model",     "type": "database",  "label": "GradingModel",           "sublabel": "grade rules + size run",   "row": 9, "col": 1 },
+    { "id": "marker-model",      "type": "database",  "label": "MarkerModel",            "sublabel": "nested panel workspace",   "row": 9, "col": 2 },
+    { "id": "marker-optimize",   "type": "backend",   "label": "Nesting Optimizer",      "sublabel": "minimize fabric waste",    "row": 9, "col": 3 },
+    { "id": "marker-fabric",     "type": "backend",   "label": "fabric.ts",              "sublabel": "width · shrinkage",        "row": 9, "col": 4 },
+    { "id": "prod-reporting",    "type": "backend",   "label": "reporting.ts",           "sublabel": "utilization · yield",      "row": 9, "col": 5 },
+
+    { "id": "prod-spec",         "type": "database",  "label": "ProductionSpec",         "sublabel": "materials · trims",        "row": 10, "col": 0 },
+    { "id": "prod-bom",          "type": "backend",   "label": "BOM",                    "sublabel": "bill of materials",        "row": 10, "col": 1 },
+    { "id": "prod-run",          "type": "backend",   "label": "ProductionRun",          "sublabel": "spec + nests → factory",   "row": 10, "col": 2 },
+    { "id": "com-orders",        "type": "backend",   "label": "Orders",                 "sublabel": "draft → fulfilled",        "row": 10, "col": 3 },
+    { "id": "com-payments",      "type": "backend",   "label": "Payments",               "sublabel": "intent · capture",         "row": 10, "col": 4 },
+    { "id": "com-entitlements",  "type": "security",  "label": "Entitlements",           "sublabel": "pattern library access",   "row": 10, "col": 5 },
+
+    { "id": "com-delivery",      "type": "backend",   "label": "Delivery",               "sublabel": "signed URLs · expiry",     "row": 11, "col": 3 },
+    { "id": "com-storefront",    "type": "frontend",  "label": "Storefront",             "sublabel": "product listings",         "row": 11, "col": 4 },
+    { "id": "com-library",       "type": "database",  "label": "PatternLibrary",         "sublabel": "licensable assets",        "row": 11, "col": 5, "tag": "G21A" }
+  ],
+  "boundaries": [
+    { "kind": "region",         "label": "App Layer",             "wraps": ["app-main", "app-renderer", "app-dashboard"] },
+    { "kind": "region",         "label": "View & Render",         "wraps": ["view-viewport", "view-sim-session", "view-camera", "view-sync", "render-adapter", "render-package"] },
+    { "kind": "region",         "label": "CAD / Pattern Design",  "wraps": ["cad-editor", "cad-ops", "cad-history", "cad-snap", "cad-dxf", "cad-export"] },
+    { "kind": "region",         "label": "Garment Assembly",      "wraps": ["garment-assembly", "garment-sewing", "garment-avatar", "garment-project", "proj-store"] },
+    { "kind": "region",         "label": "Mesh",                  "wraps": ["mesh-data", "mesh-incidence", "r-adaptive"] },
+    { "kind": "region",         "label": "Physics Core",          "wraps": ["phys-scene", "phys-material", "phys-fem", "phys-membrane", "phys-bending", "phys-membrane-hvp"] },
+    { "kind": "security-group", "label": "Solver",                "wraps": ["solver-newton", "solver-pcg", "solver-block-jacobi", "solver-schwarz"] },
+    { "kind": "security-group", "label": "Collision & Contact",   "wraps": ["coll-contact", "coll-broadphase", "coll-ccd", "coll-bvh", "coll-barrier", "coll-friction"] },
+    { "kind": "region",         "label": "Compute Backend",       "wraps": ["be-interface", "be-cpu-solver", "be-gpu-solver", "be-gpu-newton", "be-gpu-buffers", "be-gpu-pipelines"] },
+    { "kind": "region",         "label": "Grading + Marker",      "wraps": ["grading-engine", "grading-model", "marker-model", "marker-optimize", "marker-fabric", "prod-reporting"] },
+    { "kind": "region",         "label": "Production",            "wraps": ["prod-spec", "prod-bom", "prod-run"] },
+    { "kind": "region",         "label": "Commerce (isolated from engine)", "wraps": ["com-orders", "com-payments", "com-entitlements", "com-delivery", "com-storefront", "com-library"] }
+  ],
+  "connections": [
+    { "id": "main-viewport",      "from": "app-main",          "to": "view-viewport",       "label": "initializes",     "variant": "emphasis" },
+    { "id": "main-simsession",    "from": "app-main",          "to": "view-sim-session",    "label": "runs loop" },
+    { "id": "renderer-three",     "from": "app-renderer",      "to": "render-adapter",      "label": "drives" },
+    { "id": "render-threejs",     "from": "render-adapter",    "to": "ext-threejs",         "label": "wraps" },
+
+    { "id": "simsession-publish", "from": "view-sim-session",  "to": "view-viewport",       "label": "publishPositions()" },
+    { "id": "viewport-garment",   "from": "view-viewport",     "to": "garment-assembly",    "label": "setGarment()",    "variant": "emphasis" },
+
+    { "id": "editor-ops",         "from": "cad-editor",        "to": "cad-ops",             "label": "geometry ops" },
+    { "id": "editor-history",     "from": "cad-editor",        "to": "cad-history",         "label": "dispatches" },
+    { "id": "editor-snap",        "from": "cad-editor",        "to": "cad-snap",            "label": "snap resolve" },
+    { "id": "export-dxf",         "from": "cad-export",        "to": "cad-dxf",             "label": "DXF path",        "fromSide": "left", "toSide": "right" },
+
+    { "id": "assembly-mesh",      "from": "garment-assembly",  "to": "mesh-data",           "label": "preprocess()",    "variant": "emphasis" },
+    { "id": "assembly-sewing",    "from": "garment-assembly",  "to": "garment-sewing",      "label": "stitch pairs" },
+    { "id": "assembly-avatar",    "from": "garment-assembly",  "to": "garment-avatar",      "label": "collider" },
+    { "id": "project-assembly",   "from": "garment-project",   "to": "garment-assembly",    "label": "feeds",           "fromSide": "left",   "toSide": "right" },
+    { "id": "project-store",      "from": "garment-project",   "to": "proj-store",          "label": "serialized by" },
+    { "id": "scene-mesh",         "from": "phys-scene",        "to": "mesh-data",           "label": "holds ref",       "fromSide": "left",   "toSide": "right" },
+    { "id": "scene-material",     "from": "phys-scene",        "to": "phys-material",       "label": "material",        "fromSide": "left",   "toSide": "right" },
+
+    { "id": "fem-membrane",       "from": "phys-fem",          "to": "phys-membrane",       "label": "per triangle" },
+    { "id": "fem-bending",        "from": "phys-fem",          "to": "phys-bending",        "label": "per hinge" },
+    { "id": "hvp-membrane",       "from": "phys-membrane-hvp", "to": "phys-membrane",       "label": "finite diff" },
+    { "id": "pcg-hvp",            "from": "solver-pcg",        "to": "phys-membrane-hvp",   "label": "HVP(v)" },
+    { "id": "pcg-precond",        "from": "solver-pcg",        "to": "solver-block-jacobi", "label": "precondition" },
+
+    { "id": "newton-fem",         "from": "solver-newton",     "to": "phys-fem",            "label": "evalInternal()",  "variant": "emphasis" },
+    { "id": "newton-pcg",         "from": "solver-newton",     "to": "solver-pcg",          "label": "Hv=g solve",      "variant": "emphasis" },
+    { "id": "newton-ccd",         "from": "solver-newton",     "to": "coll-ccd",            "label": "gate step" },
+    { "id": "newton-contact",     "from": "solver-newton",     "to": "coll-contact",        "label": "barrier+friction","variant": "emphasis" },
+
+    { "id": "contact-bvh",        "from": "coll-contact",      "to": "coll-bvh",            "label": "traverse",        "fromSide": "right", "toSide": "left" },
+    { "id": "contact-broadphase", "from": "coll-contact",      "to": "coll-broadphase",     "label": "candidates" },
+    { "id": "contact-barrier",    "from": "coll-contact",      "to": "coll-barrier",        "label": "b(d)",            "fromSide": "right", "toSide": "bottom" },
+    { "id": "contact-friction",   "from": "coll-contact",      "to": "coll-friction",       "label": "lagged μ",        "fromSide": "bottom", "toSide": "left" },
+
+    { "id": "cpu-iface",          "from": "be-cpu-solver",     "to": "be-interface",        "label": "implements",      "fromSide": "left",   "toSide": "right" },
+    { "id": "cpu-newton",         "from": "be-cpu-solver",     "to": "solver-newton",       "label": "implicitStep()",  "variant": "emphasis" },
+    { "id": "gpu-iface",          "from": "be-gpu-solver",     "to": "be-interface",        "label": "implements",      "fromSide": "left",   "toSide": "right" },
+    { "id": "gpu-parity",         "from": "be-gpu-solver",     "to": "be-cpu-solver",       "label": "parity check",    "variant": "dashed",  "fromSide": "left", "toSide": "right" },
+    { "id": "gpu-drives",         "from": "be-gpu-solver",     "to": "be-gpu-newton",       "label": "drives" },
+    { "id": "gpu-pipelines",      "from": "be-gpu-newton",     "to": "be-gpu-pipelines",    "label": "dispatch" },
+    { "id": "gpu-buffers-rel",    "from": "be-gpu-newton",     "to": "be-gpu-buffers",      "label": "64B status",      "fromSide": "left",   "toSide": "right" },
+    { "id": "pipelines-webgpu",   "from": "be-gpu-pipelines",  "to": "ext-webgpu",          "label": "WGSL shaders" },
+
+    { "id": "grading-model-rel",  "from": "grading-engine",    "to": "grading-model",       "label": "reads rules" },
+    { "id": "marker-grading",     "from": "marker-model",      "to": "grading-engine",      "label": "graded panels",   "fromSide": "left",   "toSide": "right" },
+    { "id": "marker-optimize-rel","from": "marker-optimize",   "to": "marker-model",        "label": "places panels",   "fromSide": "left",   "toSide": "right" },
+    { "id": "marker-fabric-rel",  "from": "marker-optimize",   "to": "marker-fabric",       "label": "constraints" },
+
+    { "id": "prodrun-spec",       "from": "prod-run",          "to": "prod-spec",           "label": "reads spec",      "fromSide": "left",   "toSide": "right" },
+    { "id": "prodrun-bom",        "from": "prod-run",          "to": "prod-bom",            "label": "generates BOM",   "fromSide": "left",   "toSide": "right" },
+    { "id": "prodrun-marker",     "from": "prod-run",          "to": "marker-model",        "label": "nesting input",   "fromSide": "top",    "toSide": "bottom" },
+
+    { "id": "orders-payments",    "from": "com-orders",        "to": "com-payments",        "label": "triggers" },
+    { "id": "orders-entitlements","from": "com-orders",        "to": "com-entitlements",    "label": "grants" },
+    { "id": "orders-delivery",    "from": "com-orders",        "to": "com-delivery",        "label": "fulfills via" },
+    { "id": "entitlements-library","from": "com-entitlements", "to": "com-library",         "label": "unlocks" },
+    { "id": "storefront-orders",  "from": "com-storefront",    "to": "com-orders",          "label": "places order",    "fromSide": "left",   "toSide": "right" }
+  ],
+  "cards": [
+    { "dot": "cyan",    "title": "Physics Hot Path", "items": [
+      "Variational implicit Euler: min ½h⁻² ‖x−ŷ‖²_M + E_membrane + E_bend + E_barrier",
+      "Newton (10 iters) + Jacobi-PCG (60 iters) + CCD-gated Armijo backtracking",
+      "IPC Barrier + lagged Coulomb friction in the same Newton solve — no post-projection"
+    ]},
+    { "dot": "emerald", "title": "Design & Assembly Pipeline", "items": [
+      "PatternEditor: headless 2D CAD, no framework, full undo/redo via CadSession",
+      "GarmentAssembly (G8C): panels + seams → merged ClothMesh + ClothScene for solver",
+      "DXF full-profile import/export (G13), SVG/PDF export, grading, tech sheets"
+    ]},
+    { "dot": "violet",  "title": "GPU Backend (Phase 2)", "items": [
+      "WebGpuSolver: CPU control, GPU-resident buffers, 64 B SolverStatus readback per Newton iter",
+      "CpuSolver is the golden reference — every GPU result validated within tolerance",
+      "Broadphase + CCD remain CPU-fallback stubs until G1/G2 complete"
+    ]},
+    { "dot": "amber",   "title": "Production & Commerce", "items": [
+      "GradingEngine → MarkerModel → NestingOptimizer → ProductionRun → factory package",
+      "Commerce (G20–G21): orders, payments, entitlements, pattern library",
+      "Commerce is isolated from the garment engine — no physics imports"
+    ]}
+  ]
+}

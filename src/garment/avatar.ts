@@ -23,6 +23,12 @@ export interface AvatarSpec {
   indices: number[];
   /** Surface thickness metadata in metres; not consumed by collision. */
   thicknessM: number;
+  /**
+   * Optional decimated stand-in for the solver: when present, contact,
+   * fitting diagnostics, and placement checks use this mesh while
+   * rendering keeps the full-resolution one above.
+   */
+  collision?: AvatarSpec;
 }
 
 export interface CapsuleAvatarOptions {
@@ -150,6 +156,14 @@ export function validateAvatarSpec(avatar: AvatarSpec): void {
     if (!Number.isInteger(v) || v < 0 || v >= n) throw new RangeError(`avatar: invalid triangle index ${v}`);
   }
   nonnegative(avatar.thicknessM, "thicknessM");
+  if (avatar.collision !== undefined && avatar.collision !== null) {
+    if (avatar.collision === avatar) throw new RangeError("avatar: collision proxy must not be self-referential");
+    try {
+      validateAvatarSpec(avatar.collision);
+    } catch (error) {
+      throw new RangeError(`avatar: invalid collision proxy: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
 }
 
 /** Merge avatar parts into one static-mesh pair for `setStaticMesh`. */
@@ -282,5 +296,22 @@ export function avatarFromJSON(json: string): AvatarSpec {
   }
   const a = parsed as AvatarSpec;
   validateAvatarSpec(a);
-  return { id: a.id, bodyPart: a.bodyPart, positions: [...a.positions], indices: [...a.indices], thicknessM: a.thicknessM };
+  const clone: AvatarSpec = {
+    id: a.id,
+    bodyPart: a.bodyPart,
+    positions: [...a.positions],
+    indices: [...a.indices],
+    thicknessM: a.thicknessM,
+  };
+  if (a.collision !== undefined && a.collision !== null) {
+    const c = a.collision;
+    clone.collision = {
+      id: c.id,
+      bodyPart: c.bodyPart,
+      positions: [...c.positions],
+      indices: [...c.indices],
+      thicknessM: c.thicknessM,
+    };
+  }
+  return clone;
 }

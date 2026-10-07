@@ -335,9 +335,12 @@ export function rebuildGarment(
     throw new Error(`cannot rebuild invalid garment project:\n${validation.diagnostics.map((d) => `- ${d.code}: ${d.message}`).join("\n")}`);
   }
   const material = project.materials[project.pattern.panels[0]?.materialId] ?? { ...DEFAULT_MATERIAL };
+  // Solver-facing paths (placement diagnostics, contact) use the decimated
+  // proxy when the avatar carries one; rendering keeps the full mesh.
+  const simAvatar = project.avatar?.collision ?? project.avatar ?? null;
   const assembled = assembleGarment(project.pattern, project.seams, project.placements, {
     ...assembleOpts,
-    avatar: assembleOpts.avatar !== undefined ? assembleOpts.avatar : project.avatar,
+    avatar: assembleOpts.avatar !== undefined ? assembleOpts.avatar : simAvatar,
     interiorMaxEdgeM: assembleOpts.interiorMaxEdgeM !== undefined
       ? assembleOpts.interiorMaxEdgeM
       : (project.simulation.meshMaxEdgeM ?? undefined),
@@ -347,7 +350,7 @@ export function rebuildGarment(
     arealDensityKgM2: project.simulation.arealDensityKgM2,
     gravity: project.simulation.gravity,
     contact: project.simulation.contact,
-    avatar: project.avatar ? [project.avatar] : null,
+    avatar: simAvatar ? [simAvatar] : null,
     floorY: project.simulation.floorY,
   });
   return { assembled, fitting };

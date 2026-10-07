@@ -1,0 +1,8 @@
+{
+  "schemaVersion": 1,
+  "command": "deliver",
+  "status": "pending",
+  "receiptId": "6a3f3028-58d4-45cd-8a36-18c2b5108ec6",
+  "input": "C:\\Users\\Abrar\\Desktop\\closim\\.archify\\closim-arch-20261007T1351\\candidate.json",
+  "output": "C:\\Users\\Abrar\\Desktop\\closim\\.archify\\closim-arch-20261007T1351\\closim.html"
+}
