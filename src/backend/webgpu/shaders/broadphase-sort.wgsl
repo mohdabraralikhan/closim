@@ -115,3 +115,31 @@ fn sort_step_indexed(@builtin(global_invocation_id) gid : vec3u) {
   let prm = sortParams[t];
   compareSwap(i, prm.x, prm.y, prm.z);
 }
+
+// Reset sortCursor to 0 via a GPU compute pass, eliminating the CPU writeBuffer flush.
+@compute @workgroup_size(64)
+fn sort_reset(@builtin(global_invocation_id) gid : vec3u) {
+  if (gid.x + gid.y * 4194240u != 0u) { return; }
+  sortCursor[0] = 0u;
+}
+
+// Approach A: derive (stage k, substage j) directly inside WGSL from linear pass index t.
+// k = floor((sqrt(8t + 1) + 1) / 2)
+// offset = t - k*(k - 1)/2
+// sub = (k - 1) - offset
+// Eliminates sortParams storage buffer table upload entirely.
+fn bitonic_params_derive(t : u32) -> vec2u {
+  let k = u32(floor((sqrt(f32(8u * t + 1u)) + 1.0) * 0.5));
+  let offset = t - (k * (k - 1u)) / 2u;
+  let sub = (k - 1u) - offset;
+  return vec2u(k, sub);
+}
+
+@compute @workgroup_size(64)
+fn sort_step_derived(@builtin(global_invocation_id) gid : vec3u) {
+  let i = gid.x + gid.y * 4194240u;
+  let t = sortCursor[0] - 1u;
+  let ks = bitonic_params_derive(t);
+  compareSwap(i, n, ks.x, ks.y);
+}
+

@@ -224,6 +224,7 @@ export class GpuExecutor {
     const have = this.buffers.get(name);
     if (have && (this.bufferBytes.get(name) ?? 0) >= bytes) return have;
     if (have) {
+      this.bindGroups.clear();
       try { have.destroy(); } catch { /* best effort */ }
     }
     const buf = this.device.createBuffer({
@@ -425,13 +426,11 @@ export class GpuExecutor {
     // workgroups (4,194,240 threads at workgroup 64). Counts past that
     // (contact expand at 50k dispatches 188160 groups) split across Y rows;
     // shaders compute the flat index as gid.x + gid.y * 4194240.
-    // Reductions and sorts (pcg-reduce, diagnostics, broadphase-sort) are
-    // NOT row-splittable — their counts are vertex/element/contact scale
-    // and stay far below the cap; exceeding it is a loud error, never
-    // silent truncation. No caller passes y today (all dispatches are 1D).
+    // Reductions (pcg-reduce, diagnostics) are NOT row-splittable;
+    // broadphase-sort computes flat index gid.x + gid.y * 4194240 and is row-splittable.
     const MAX_GROUPS_X = 65535;
     const NO_SPLIT: ReadonlySet<string> = new Set(
-      ["pcg-reduce", "diagnostics", "broadphase-sort"],
+      ["pcg-reduce", "diagnostics"],
     );
     let dx = spec.x;
     let dy = spec.y ?? 1;

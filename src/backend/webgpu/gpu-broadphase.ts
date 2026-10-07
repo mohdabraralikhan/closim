@@ -31,6 +31,8 @@ import {
   candidatePairKey,
 } from "../../collision/broadphase.js";
 import { buildAdjacencyExclusions } from "../../collision/bvh.js";
+import type { GpuExecutor } from "./gpu-executor.js";
+import { GpuUniformSlot, UNIFORM_SLOT_STRIDE } from "./gpu-buffers.js";
 
 const f = (v: number): number => Math.fround(v);
 
@@ -383,3 +385,140 @@ export class GpuBroadPhase implements BroadPhase {
     };
   }
 }
+
+export type BitonicSortMode = "legacy" | "static-slots" | "wgsl-derived";
+
+export interface BitonicSortOptions {
+  P: number;
+  mode: BitonicSortMode;
+  keysBuffer?: string;
+  payloadBuffer?: string;
+  paramsBuffer?: string;
+  cursorBuffer?: string;
+  uniformSlotN?: number;
+  uniformSlotStage?: number;
+  uniformSlotSub?: number;
+  explicitDispatch?: { x: number; y: number };
+}
+
+/** Pre-computes the static parameter table for Approach B (T passes of vec4u (P, stage, sub, 0)). */
+export function buildBitonicParamsTable(P: number): Uint32Array {
+  const stages = Math.log2(P);
+  const T = bitonicPassCount(stages);
+  const table = new Uint32Array(T * 4);
+  for (let t = 0; t < T; t++) {
+    const { stage, sub } = bitonicPassAt(t);
+    table[t * 4] = P >>> 0;
+    table[t * 4 + 1] = stage >>> 0;
+    table[t * 4 + 2] = sub >>> 0;
+    table[t * 4 + 3] = 0;
+  }
+  return table;
+}
+
+/**
+ * Encode GPU bitonic sort passes into an open executor batch.
+ *
+ * Modes:
+ * - "legacy": Uniform rewriting per sub-pass (causes intermediate queue flushes).
+ * - "static-slots" (Approach B): Static pre-computed table + GPU cursor. Uses
+ *   sort_reset GPU pass to avoid CPU writeBuffer flush -> runs in 1 single submit!
+ * - "wgsl-derived" (Approach A): Stage/sub derived on GPU inside WGSL from cursor.
+ *   Eliminates sortParams buffer allocation and upload entirely -> 1 single submit!
+ */
+export function encodeBitonicSort(ex: GpuExecutor, opts: BitonicSortOptions): void {
+  const P = opts.P;
+  const stages = Math.log2(P);
+  const T = bitonicPassCount(stages);
+  const keysBuf = opts.keysBuffer ?? "mortonKeys";
+  const payBuf = opts.payloadBuffer ?? "mortonPayload";
+  const paramsBuf = opts.paramsBuffer ?? "sortParams";
+  const cursorBuf = opts.cursorBuffer ?? "sortCursor";
+  const slotN = opts.uniformSlotN ?? GpuUniformSlot.SortN;
+  const slotStage = opts.uniformSlotStage ?? GpuUniformSlot.SortStage;
+  const slotSub = opts.uniformSlotSub ?? GpuUniformSlot.SortSub;
+
+  const totalGroups = Math.max(1, Math.ceil(P / 64));
+  let dx = totalGroups;
+  let dy = 1;
+  if (opts.explicitDispatch) {
+    dx = opts.explicitDispatch.x;
+    dy = opts.explicitDispatch.y;
+  } else if (totalGroups > 65535) {
+    dx = 65535;
+    dy = Math.ceil(totalGroups / 65535);
+  }
+
+  if (opts.mode === "legacy") {
+    for (let k = 1; k <= stages; k++) {
+      for (let j = k - 1; j >= 0; j--) {
+        ex.writeBankU32(slotN, P);
+        ex.writeBankU32(slotStage, k);
+        ex.writeBankU32(slotSub, j);
+        ex.runPass({
+          shader: "broadphase-sort", entry: "bitonic_sort_step",
+          groups: [[
+            { binding: 0, buffer: keysBuf },
+            { binding: 1, buffer: payBuf },
+            { binding: 2, buffer: ex.uniformBankName, offset: slotN * UNIFORM_SLOT_STRIDE, size: 4 },
+            { binding: 3, buffer: ex.uniformBankName, offset: slotStage * UNIFORM_SLOT_STRIDE, size: 4 },
+            { binding: 4, buffer: ex.uniformBankName, offset: slotSub * UNIFORM_SLOT_STRIDE, size: 4 },
+          ]],
+          x: dx, y: dy,
+        });
+      }
+    }
+  } else if (opts.mode === "static-slots") {
+    // Approach B: static table + GPU cursor.
+    // Reset cursor via GPU pass - ZERO CPU writes, ZERO flushes!
+    ex.runPass({
+      shader: "broadphase-sort", entry: "sort_reset",
+      groups: [[{ binding: 6, buffer: cursorBuf }]],
+      x: 1,
+    });
+    for (let t = 0; t < T; t++) {
+      ex.runPass({
+        shader: "broadphase-sort", entry: "sort_next",
+        groups: [[{ binding: 6, buffer: cursorBuf }]],
+        x: 1,
+      });
+      ex.runPass({
+        shader: "broadphase-sort", entry: "sort_step_indexed",
+        groups: [[
+          { binding: 0, buffer: keysBuf },
+          { binding: 1, buffer: payBuf },
+          { binding: 5, buffer: paramsBuf },
+          { binding: 6, buffer: cursorBuf },
+        ]],
+        x: dx, y: dy,
+      });
+    }
+  } else if (opts.mode === "wgsl-derived") {
+    // Approach A: WGSL derivation of (k, j) from cursor index t.
+    // Reset cursor via GPU pass - ZERO CPU writes, ZERO flushes!
+    ex.runPass({
+      shader: "broadphase-sort", entry: "sort_reset",
+      groups: [[{ binding: 6, buffer: cursorBuf }]],
+      x: 1,
+    });
+    // Note: n is constant and should be written once before opening the batch (or at scene init).
+    for (let t = 0; t < T; t++) {
+      ex.runPass({
+        shader: "broadphase-sort", entry: "sort_next",
+        groups: [[{ binding: 6, buffer: cursorBuf }]],
+        x: 1,
+      });
+      ex.runPass({
+        shader: "broadphase-sort", entry: "sort_step_derived",
+        groups: [[
+          { binding: 0, buffer: keysBuf },
+          { binding: 1, buffer: payBuf },
+          { binding: 2, buffer: ex.uniformBankName, offset: slotN * UNIFORM_SLOT_STRIDE, size: 4 },
+          { binding: 6, buffer: cursorBuf },
+        ]],
+        x: dx, y: dy,
+      });
+    }
+  }
+}
+
