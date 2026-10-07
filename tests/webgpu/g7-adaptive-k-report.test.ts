@@ -33,7 +33,7 @@ function floorRestingScene(): ReturnType<typeof createScene> {
   const g = buildGrid(6, 6, 0.12, 0.12);
   const mesh = preprocess(g.positions, g.uv, g.indices, 0.15);
   const scene = createScene(mesh, { ...DEFAULT_MATERIAL }, [0, -9.81, 0]);
-  (scene as unknown as { contact: { floorY: number } }).contact = {
+  (scene as unknown as { contact: unknown }).contact = {
     ...scene.contact,
     floorY: 0.0,
     params: { ...DEFAULT_CONTACT_PARAMS },
