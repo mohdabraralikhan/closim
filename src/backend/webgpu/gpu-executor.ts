@@ -188,13 +188,37 @@ export class GpuExecutor {
         })(),
         subgroups: features.includes("subgroups"),
       };
-      return new GpuExecutor(device, facts, usageBits(loaded.globals), mapModeBits(loaded.globals));
+      const exec = new GpuExecutor(device, facts, usageBits(loaded.globals), mapModeBits(loaded.globals));
+      exec.attachValidationListener();
+      return exec;
     } catch {
       return null;
     }
   }
 
-  // ---- buffers ----
+  /** Attach the uncaptured-error listener (called once at create). */
+  attachValidationListener(): void {
+    const dev = this.device as any;
+    if (!dev) return;
+    this.validationScopesSupported =
+      typeof dev.pushErrorScope === "function" && typeof dev.popErrorScope === "function";
+    const record = (e: any): void => {
+      try {
+        const type = String(
+          (e as any)?.error?.errorType ?? (e as any)?.type ?? "uncapturederror",
+        );
+        const message = String((e as any)?.error?.message ?? (e as any)?.message ?? e).slice(0, 400);
+        this.uncapturedErrors.push({ type, message });
+      } catch { /* a listener must never throw */ }
+    };
+    try {
+      if (typeof dev.addEventListener === "function") {
+        dev.addEventListener("uncapturederror", record);
+      } else {
+        try { dev.onuncapturederror = record; } catch { /* best effort */ }
+      }
+    } catch { /* best effort */ }
+  }
 
   ensureBuffer(name: string, bytes: number, usage: number, label?: string): any {
     const have = this.buffers.get(name);
@@ -232,6 +256,10 @@ export class GpuExecutor {
     // GPU write can stale this cache) skips identical rewrites, letting the
     // open batch extend across passes. Everything else always flushes:
     // STORAGE buffers may hold GPU-written results a rewrite must not hide.
+    // GLOBAL INVARIANT (G6C): no shader in this codebase writes a UNIFORM
+    // buffer or bank slot. If one ever does, this cache silently returns
+    // stale values — grep for `var<uniform>` write targets before adding any
+    // storage-write to a uniform-bound buffer.
     const bytes = new Uint8Array((data as any).buffer, (data as any).byteOffset, (data as any).byteLength);
     if ((name === this.uniformBankName || name === "simParams") && bytes.byteLength <= 256) {
       const key = `${name}@${offset}`;
@@ -507,6 +535,60 @@ export class GpuExecutor {
 
   get uniformBankName(): string {
     return "uniformBank";
+  }
+
+  /** Uncaptured WebGPU errors observed on this device (dev/test mechanism:
+   *  a poisoned queue can leave status buffers stale/zero, which decodes as
+   *  convergence — these must surface loudly instead). Drained by
+   *  popValidationScope / consumeUncapturedErrors. */
+  uncapturedErrors: Array<{ type: string; message: string }> = [];
+  /** True when device.pushErrorScope/popErrorScope exist (else no-op). */
+  validationScopesSupported = false;
+  private validationScopeDepth = 0;
+
+  /** Push a `validation` error scope. No-op when the binding lacks scopes. */
+  pushValidationScope(): void {
+    this.validationScopeDepth++;
+    try {
+      (this.device as any)?.pushErrorScope?.("validation");
+    } catch { /* scope tracking is best-effort; listener still records */ }
+  }
+
+  /**
+   * Pop one validation scope: any error captured between push and pop is
+   * recorded in uncapturedErrors AND thrown, so a poisoned batch can never
+   * decode a stale/zero status as convergence. Also drains errors the
+   * uncaptured listener observed in the window.
+   */
+  async popValidationScope(label: string): Promise<void> {
+    if (this.validationScopeDepth > 0) this.validationScopeDepth--;
+    let scopeErr: any = null;
+    try {
+      scopeErr = await (this.device as any)?.popErrorScope?.();
+    } catch (err) {
+      scopeErr = err;
+    }
+    if (scopeErr) {
+      const message = String((scopeErr as any)?.message ?? scopeErr);
+      this.uncapturedErrors.push({ type: "validation-scope", message: `${label}: ${message}` });
+      throw new Error(`GpuExecutor validation error (${label}): ${message}`);
+    }
+    this.assertNoUncapturedErrors(label);
+  }
+
+  /** Throw if the uncaptured listener observed errors since the last drain. */
+  assertNoUncapturedErrors(context: string): void {
+    if (this.uncapturedErrors.length === 0) return;
+    const errs = this.uncapturedErrors.splice(0, this.uncapturedErrors.length);
+    throw new Error(
+      `GpuExecutor uncaptured WebGPU error(s) (${context}): ` +
+      errs.map((e) => `[${e.type}] ${e.message}`).join(" | ").slice(0, 800),
+    );
+  }
+
+  /** Drain and return pending uncaptured errors without throwing (tests). */
+  consumeUncapturedErrors(): Array<{ type: string; message: string }> {
+    return this.uncapturedErrors.splice(0, this.uncapturedErrors.length);
   }
 
   /** Write one 16 B uniform-bank slot (f32[4] payload). */

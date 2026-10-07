@@ -103,6 +103,9 @@ fn commit_arm(@builtin(global_invocation_id) gid : vec3u) {
   if (gid.x + gid.y * 4194240u != 0u) { return; }
   let b = caCtl[5]; // nbBatch counter (f32 holding u32, exact for small ints)
   let bi = u32(b + 0.5);
+  // Cumulative trial base entering this batch (correct under varying batch
+  // widths, unlike bi*K — the hook adaptive-K will pull).
+  let base = u32(caCtl[7] + 0.5);
   let localAccept = caBatch[0] > 0.5;
   // sticky failure-flag ORs (per-batch counters would otherwise be lost)
   if (caBatch[7] > 0.0) { caStatus[15] = 1.0; }
@@ -117,7 +120,7 @@ fn commit_arm(@builtin(global_invocation_id) gid : vec3u) {
     caCtl[4] = caBatch[1]; // nbAlpha (effective)
     caCtl[6] = f32(bi); // nbAcceptBatch
     let li = u32(caBatch[2] + 0.5); // local selected index
-    caCtl[8] = f32(bi * caK + li); // global trial index
+    caCtl[8] = f32(base + li); // global trial index (cumulative base)
     // merit BEFORE overwriting e0 (round-start energy minus accepted)
     caStatus[11] = caE0[0] - caBatch[9];
     caE0[0] = caBatch[9]; // latch accepted energy for later rounds
@@ -126,7 +129,7 @@ fn commit_arm(@builtin(global_invocation_id) gid : vec3u) {
     caStatus[14] = caBatch[14];
   }
   caCtl[5] = f32(bi + 1u);
-  caCtl[7] = caCtl[7] + f32(caK); // nbTrialBase advance (exact for small ints)
+  caCtl[7] = f32(base + caK); // advance by THIS batch's width
 }
 
 // ---- commit_apply re-materializes xTrial at the LATCHED accepted alpha.
@@ -164,7 +167,9 @@ fn commit_apply(@builtin(global_invocation_id) gid : vec3u) {
 fn commit_copy_if(@builtin(global_invocation_id) gid : vec3u) {
   let v = gid.x + gid.y * 4194240u;
   if (v >= ccParams.vertexCount) { return; }
-  if (ccCtl[3] < 0.5) { return; }
+  // nbAccepted (lane 2, sticky across batches), NOT per-batch doCommit:
+  // the single end-of-round commit fires iff ANY batch accepted.
+  if (ccCtl[2] < 0.5) { return; }
   ccPos[v] = ccTrial[v];
 }
 
@@ -179,7 +184,8 @@ fn commit_copy_if(@builtin(global_invocation_id) gid : vec3u) {
 fn commit_lagged_if(@builtin(global_invocation_id) gid : vec3u) {
   let i = gid.x + gid.y * 4194240u;
   if (i >= clParams.contactCount) { return; }
-  if (clCtl[3] < 0.5) { return; }
+  // See commit_copy_if: sticky nbAccepted, not per-batch doCommit.
+  if (clCtl[2] < 0.5) { return; }
   // Same body as contact-force commit_lagged (d>=dHat keeps stale entry).
   let d = max(clDist[i], 1e-12);
   let prm = clPrm[i];

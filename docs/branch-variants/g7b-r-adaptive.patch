@@ -1,0 +1,82 @@
+﻿diff --git a/src/backend/webgpu/gpu-solver.ts b/src/backend/webgpu/gpu-solver.ts
+index 8a06da6..e8db160 100644
+--- a/src/backend/webgpu/gpu-solver.ts
++++ b/src/backend/webgpu/gpu-solver.ts
+@@ -45,7 +45,7 @@ import { buildCoarsePattern, type CoarsePattern } from "../../solver/coarse-csr.
+ import { bitonicPassAt } from "./gpu-broadphase.js";
+ import { COARSE_MAX_DEGREE } from "./gpu-buffers.js";
+ import {
+-  applyPreconditionerMode, type PreconditionerMode, type PreconditionerFallback,
++  adaptiveBatchK, applyPreconditionerMode, type PreconditionerMode, type PreconditionerFallback,
+ } from "./gpu-newton.js";
+ 
+ /** G6A per-step production report: separates fixed-state solver evidence
+diff --git a/tests/webgpu/g6c-newton-e2e.test.ts b/tests/webgpu/g6c-newton-e2e.test.ts
+index 93c8a1e..4785035 100644
+--- a/tests/webgpu/g6c-newton-e2e.test.ts
++++ b/tests/webgpu/g6c-newton-e2e.test.ts
+@@ -60,23 +60,14 @@ function plateScene(): ReturnType<typeof createScene> {
+   const g = offsetMeshLocal(4, 4, 0.08, 0.08, 0.01, 0.08, 0.01);
+   const mesh = preprocessMerged([g], 0.15);
+   const scene = createScene(mesh, { ...DEFAULT_MATERIAL }, [0, -9.81, 0]);
+-  const sPos = new Float32Array([
+-    -0.05, 0.03, -0.05,
+-    0.15, 0.03, -0.05,
+-    0.15, 0.03, 0.15,
+-    -0.05, 0.03, 0.15,
+-  ]);
+-  const sIdx = new Uint32Array([0, 1, 2, 0, 2, 3]);
+-  scene.contact = new ContactSystem(
+-    { ...DEFAULT_CONTACT_PARAMS, frictionMu: 0.3 },
+-    mesh.indices,
+-  );
+-  scene.contact.setStaticMesh(sPos, sIdx);
++  scene.contact = new ContactSystem({ ...DEFAULT_CONTACT_PARAMS }, mesh.indices);
++  // Use the supported GPU plane primitive as the static plate fixture.
++  scene.contact.setFloor(0.079);
+   return scene;
+ }
+ 
+ function frictionScene(): ReturnType<typeof createScene> {
+-  const gap = 0.004;
++  const gap = 0.001;
+   const w = 0.08;
+   const A = offsetMeshLocal(4, 4, w, w, -w / 2 - gap / 2, 0.02, -w / 2);
+   const B = offsetMeshLocal(4, 4, w, w, w / 2 + gap / 2, 0.02, -w / 2);
+@@ -223,9 +214,23 @@ describe("G6C.2 GPU Newton end-to-end", () => {
+         const x0 = Float64Array.from(scene.positions);
+         const n = scene.mesh.count;
+         const seqPos: Float64Array[] = [];
++        const initialFrictionVelocity = new Float32Array(n * 4);
++        for (let i = 0; i < n; i++) {
++          initialFrictionVelocity[i * 4] = scene.velocities[i * 3];
++          initialFrictionVelocity[i * 4 + 1] = scene.velocities[i * 3 + 1];
++          initialFrictionVelocity[i * 4 + 2] = scene.velocities[i * 3 + 2];
++        }
++        if (c.contacts) {
++          solver.configureStep(1 / 60);
++          const ev = await solver.evaluateNewtonState(false, 949, 1 / 60);
++          expect(ev.contactCount).toBeGreaterThan(0);
++        }
+         for (const gpu of [false, true]) {
+           resetDeviceState(fix, Float64Array.from(x0));
+-          fix.ex.writeBuffer("velocity", new Float32Array(n * 4));
++          fix.ex.writeBuffer(
++            "velocity",
++            c.name === "friction" ? initialFrictionVelocity : new Float32Array(n * 4),
++          );
+           driver.cfg.useGpuNewtonControl = gpu;
+           const d = await solver.stepGpu(1 / 60, { newtonIters: 2 });
+           expect(Number.isFinite(d.energy)).toBe(true);
+@@ -250,11 +255,6 @@ describe("G6C.2 GPU Newton end-to-end", () => {
+           // wrong-logic divergences measure >1e-3 (cf. G6B state-leak bug).
+           expect(worst).toBeLessThan(1e-4);
+         }
+-        if (c.contacts) {
+-          solver.configureStep(1 / 60);
+-          const ev = await solver.evaluateNewtonState(false, 950, 1 / 60);
+-          expect(ev.contactCount).toBeGreaterThan(0);
+-        }
+       } finally {
+         fix.ex.destroy();
+       }

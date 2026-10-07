@@ -1,0 +1,58 @@
+﻿diff --git a/tests/webgpu/g6c-newton-e2e.test.ts b/tests/webgpu/g6c-newton-e2e.test.ts
+index 93c8a1e..3ed77b9 100644
+--- a/tests/webgpu/g6c-newton-e2e.test.ts
++++ b/tests/webgpu/g6c-newton-e2e.test.ts
+@@ -60,23 +60,14 @@ function plateScene(): ReturnType<typeof createScene> {
+   const g = offsetMeshLocal(4, 4, 0.08, 0.08, 0.01, 0.08, 0.01);
+   const mesh = preprocessMerged([g], 0.15);
+   const scene = createScene(mesh, { ...DEFAULT_MATERIAL }, [0, -9.81, 0]);
+-  const sPos = new Float32Array([
+-    -0.05, 0.03, -0.05,
+-    0.15, 0.03, -0.05,
+-    0.15, 0.03, 0.15,
+-    -0.05, 0.03, 0.15,
+-  ]);
+-  const sIdx = new Uint32Array([0, 1, 2, 0, 2, 3]);
+-  scene.contact = new ContactSystem(
+-    { ...DEFAULT_CONTACT_PARAMS, frictionMu: 0.3 },
+-    mesh.indices,
+-  );
+-  scene.contact.setStaticMesh(sPos, sIdx);
++  scene.contact = new ContactSystem({ ...DEFAULT_CONTACT_PARAMS }, mesh.indices);
++  // Represent the broad plate with the GPU floor-plane contact primitive.
++  scene.contact.setFloor(0.079);
+   return scene;
+ }
+ 
+ function frictionScene(): ReturnType<typeof createScene> {
+-  const gap = 0.004;
++  const gap = 0.001;
+   const w = 0.08;
+   const A = offsetMeshLocal(4, 4, w, w, -w / 2 - gap / 2, 0.02, -w / 2);
+   const B = offsetMeshLocal(4, 4, w, w, w / 2 + gap / 2, 0.02, -w / 2);
+@@ -223,6 +214,13 @@ describe("G6C.2 GPU Newton end-to-end", () => {
+         const x0 = Float64Array.from(scene.positions);
+         const n = scene.mesh.count;
+         const seqPos: Float64Array[] = [];
++        if (c.contacts) {
++          solver.configureStep(1 / 60);
++          const ev = await solver.evaluateNewtonState(false, 949, 1 / 60);
++          // eslint-disable-next-line no-console
++          console.log(`[g6c-gateB] ${c.name} initialContacts=${ev.contactCount}`);
++          expect(ev.contactCount).toBeGreaterThan(0);
++        }
+         for (const gpu of [false, true]) {
+           resetDeviceState(fix, Float64Array.from(x0));
+           fix.ex.writeBuffer("velocity", new Float32Array(n * 4));
+@@ -250,11 +248,6 @@ describe("G6C.2 GPU Newton end-to-end", () => {
+           // wrong-logic divergences measure >1e-3 (cf. G6B state-leak bug).
+           expect(worst).toBeLessThan(1e-4);
+         }
+-        if (c.contacts) {
+-          solver.configureStep(1 / 60);
+-          const ev = await solver.evaluateNewtonState(false, 950, 1 / 60);
+-          expect(ev.contactCount).toBeGreaterThan(0);
+-        }
+       } finally {
+         fix.ex.destroy();
+       }

@@ -1,0 +1,404 @@
+﻿diff --git a/src/backend/webgpu/gpu-executor.ts b/src/backend/webgpu/gpu-executor.ts
+index 11c4d55..c2f2dd1 100644
+--- a/src/backend/webgpu/gpu-executor.ts
++++ b/src/backend/webgpu/gpu-executor.ts
+@@ -232,6 +232,10 @@ export class GpuExecutor {
+     // GPU write can stale this cache) skips identical rewrites, letting the
+     // open batch extend across passes. Everything else always flushes:
+     // STORAGE buffers may hold GPU-written results a rewrite must not hide.
++    // GLOBAL INVARIANT (G6C): no shader in this codebase writes a UNIFORM
++    // buffer or bank slot. If one ever does, this cache silently returns
++    // stale values — grep for `var<uniform>` write targets before adding any
++    // storage-write to a uniform-bound buffer.
+     const bytes = new Uint8Array((data as any).buffer, (data as any).byteOffset, (data as any).byteLength);
+     if ((name === this.uniformBankName || name === "simParams") && bytes.byteLength <= 256) {
+       const key = `${name}@${offset}`;
+diff --git a/src/backend/webgpu/gpu-newton.ts b/src/backend/webgpu/gpu-newton.ts
+index 6784c52..284706e 100644
+--- a/src/backend/webgpu/gpu-newton.ts
++++ b/src/backend/webgpu/gpu-newton.ts
+@@ -449,14 +449,19 @@ export class DeviceNewtonDriver {
+   /** G6C.1 indexed sort: identical Batcher network, zero per-pass CPU
+    *  uniforms. The cursor/triples walk the same (k,j) sequence the legacy
+    *  loop would issue (see bitonicPassAt); all T sub-passes stay in flight
+-   *  with no added submits. sortParams uploaded once per scene. */
++   *  with no added submits. sortParams uploaded once per scene. The cursor
++   *  reset is itself a GPU pass (no control-write flush); lane 1 carries T,
++   *  and lane 2 latches invalid cursor use for debug validation. */
+   sortPassesIndexed(): void {
+     const m = this.c.m;
+     const P = nextPow2(Math.max(m, 1));
+     const stages = Math.log2(P);
+     const T = (stages * (stages + 1)) / 2;
+-    // Cursor reset (one control write before the batch opens work).
+-    this.ex.writeBuffer("sortCursor", new Uint32Array([0, 0, 0, 0]));
++    this.ex.runPass({
++      shader: "broadphase-sort", entry: "sort_reset",
++      groups: [[B(6, "sortCursor")]],
++      x: 1,
++    });
+     for (let t = 0; t < T; t++) {
+       this.ex.runPass({
+         shader: "broadphase-sort", entry: "sort_next",
+@@ -2025,8 +2030,11 @@ export class DeviceNewtonDriver {
+       ]],
+       x: this.w(this.n3),
+     });
+-    // 7. B Armijo batches with predicated commit (per-batch CPU param writes
+-    //    flush only — no syncs; the loop always runs all slots (bounded)).
++    // 7. B Armijo batches with first-accept arbitration (per-batch CPU param
++    //    writes flush only — no syncs; the loop always runs all slots
++    //    (bounded)). Commit happens ONCE after the loop (see below), so
++    //    position never advances mid-round and later batches evaluate from
++    //    the round-start state exactly like the sequential solver.
+     let trialBase = 0;
+     for (let b = 0; b < opts.batchKs.length; b++) {
+       const K = opts.batchKs[b];
+@@ -2044,7 +2052,7 @@ export class DeviceNewtonDriver {
+         this.armijoTrialPasses(j, opts.mat, opts.contact, opts.evalIndexBase + trialBase + j);
+       }
+       this.armijoSelectPass();
+-      // commit arbitration + refresh + predicated commit
++      // First-accept arbitration only (no commit yet — see step 7b).
+       this.ex.runPass({
+         shader: "newton-control", entry: "commit_arm",
+         groups: [[
+@@ -2054,36 +2062,45 @@ export class DeviceNewtonDriver {
+         ]],
+         x: 1,
+       });
+-      // Commit refresh: re-materialize xTrial at the latched alpha, rebuild
+-      // records there, then predicated copy. (Without the re-apply, xTrial
+-      // would still hold the last candidate — not necessarily accepted.)
+-      this.ex.runPass({
+-        shader: "newton-control", entry: "commit_apply",
+-        groups: [[
+-          B(64, "position"), B(65, "searchDirection"), B(66, "xTrial"),
+-          B(67, "pinMask"), B(68, "pinPos"), B(69, "newtonCtl"),
+-        ]],
+-        x: this.w(this.c.n),
+-      });
+-      this.rebuildTrialPasses(opts.mat, opts.contact);
+-      this.ex.runPass({
+-        shader: "newton-control", entry: "commit_copy_if",
+-        groups: [[
+-          B(60, "xTrial"), B(61, "position"), B(62, "newtonCtl"),
+-          B(63, "simParams"),
+-        ]],
+-        x: this.w(this.c.nExt),
+-      });
+-      this.ex.runPass({
+-        shader: "newton-control", entry: "commit_lagged_if",
+-        groups: [[
+-          B(70, "contactN"), B(71, "contactDist"), B(72, "contactPrm"),
+-          B(73, "laggedN"), B(74, "newtonCtl"), B(75, "simParams"),
+-        ]],
+-        x: this.w(Math.max(this.c.cap, 1)),
+-      });
+       trialBase += K;
+     }
++    // 7b. Single end-of-round commit: re-materialize xTrial at the latched
++    // alpha, rebuild records there, then predicated copy. Position moves at
++    // most once per round, so records stay in sync with position by
++    // construction (S1: the old per-batch commit desynced them on
++    // accept-then-reject).
++    this.ex.runPass({
++      shader: "newton-control", entry: "commit_apply",
++      groups: [[
++        B(64, "position"), B(65, "searchDirection"), B(66, "xTrial"),
++        B(67, "pinMask"), B(68, "pinPos"), B(69, "newtonCtl"),
++      ]],
++      x: this.w(this.c.n),
++    });
++    // The last Armijo candidate leaves contactCount and its record arrays
++    // populated. The round-boundary rebuild must start from empty records so
++    // it materializes exactly one contact set for the latched xTrial.
++    this.armijoClearPass();
++    this.rebuildTrialPasses(opts.mat, opts.contact);
++    this.ex.runPass({
++      shader: "newton-control", entry: "commit_copy_if",
++      groups: [[
++        B(60, "xTrial"), B(61, "position"), B(62, "newtonCtl"),
++        B(63, "simParams"),
++      ]],
++      x: this.w(this.c.nExt),
++    });
++    this.ex.runPass({
++      shader: "newton-control", entry: "commit_lagged_if",
++      groups: [[
++        B(70, "contactN"), B(71, "contactDist"), B(72, "contactPrm"),
++        B(73, "laggedN"), B(74, "newtonCtl"), B(75, "simParams"),
++      ]],
++      x: this.w(Math.max(this.c.cap, 1)),
++    });
++    // Marker evidence per round (1 pass + the bankU flush, no syncs): without
++    // this, marks accumulated inside the round would never reach execMarker.
++    this.flushMarks();
+     // 8. Round report + the single status readback per round.
+     this.ex.runPass({
+       shader: "newton-control", entry: "round_report",
+diff --git a/src/backend/webgpu/gpu-pipelines.ts b/src/backend/webgpu/gpu-pipelines.ts
+index a264b67..4aaf3c7 100644
+--- a/src/backend/webgpu/gpu-pipelines.ts
++++ b/src/backend/webgpu/gpu-pipelines.ts
+@@ -79,7 +79,7 @@ export const SHADER_ENTRY_POINTS: Record<ShaderName, string[]> = {
+   "barrier-hvp": ["barrier_hvp_project", "assemble_barrier_hvp", "contact_diag"],
+   "broadphase-aabb": ["main"],
+   "broadphase-morton": ["main"],
+-  "broadphase-sort": ["bitonic_sort_step", "sort_next", "sort_step_indexed"],
++  "broadphase-sort": ["bitonic_sort_step", "sort_next", "sort_reset", "sort_step_indexed"],
+   "broadphase-lbvh": ["lbvh_seed_leaves", "lbvh_build", "lbvh_find_root", "lbvh_refit"],
+   "broadphase-traverse": ["traverse"],
+   "closest-vt": ["closest_vt"],
+diff --git a/src/backend/webgpu/gpu-solver.ts b/src/backend/webgpu/gpu-solver.ts
+index 8a06da6..63378bc 100644
+--- a/src/backend/webgpu/gpu-solver.ts
++++ b/src/backend/webgpu/gpu-solver.ts
+@@ -45,7 +45,8 @@ import { buildCoarsePattern, type CoarsePattern } from "../../solver/coarse-csr.
+ import { bitonicPassAt } from "./gpu-broadphase.js";
+ import { COARSE_MAX_DEGREE } from "./gpu-buffers.js";
+ import {
+-  applyPreconditionerMode, type PreconditionerMode, type PreconditionerFallback,
++  applyPreconditionerMode, adaptiveBatchK,
++  type PreconditionerMode, type PreconditionerFallback,
+ } from "./gpu-newton.js";
+ 
+ /** G6A per-step production report: separates fixed-state solver evidence
+@@ -558,6 +559,7 @@ export class WebGpuSolver implements ClothSolver {
+     }
+     // G6C.1 indexed-sort static table: (P, stage, sub, 0) per sub-pass t
+     // (depends only on mesh size; uploaded once, read by sort_step_indexed).
++    // sortCursor lane 1 carries T so steps can clamp defensively.
+     {
+       const P2 = nextPow2(Math.max(scene.mesh.triCount, 1));
+       const stages = Math.log2(P2);
+@@ -571,7 +573,7 @@ export class WebGpuSolver implements ClothSolver {
+         table[t * 4 + 3] = 0;
+       }
+       put("sortParams", table);
+-      put("sortCursor", new Uint32Array([0, 0, 0, 0]));
++      put("sortCursor", new Uint32Array([0, T, 0, 0]));
+     }
+     // exclusion keys as (lo,hi) vec2u pairs (G2 encoding, uploaded once)
+     {
+@@ -913,10 +915,14 @@ export class WebGpuSolver implements ClothSolver {
+           converged: 0,
+         };
+         lastTrial = trialsUsed - K + st.selectedIndex;
++        // G6C.3 history feed (same semantics as the GPU-control path: global
++        // accepted trial index, -1 when the search exhausts the budget).
++        this.trialHistory.push(trialsUsed - K + st.selectedIndex);
+         return { alpha: st.selectedAlpha / opts.trustScale, accepted: true, status };
+       }
+       alphaBase *= Math.pow(0.5, adv);
+     }
++    this.trialHistory.push(-1);
+     return { alpha: alphaBase, accepted: false, status: null };
+   }
+ 
+@@ -932,10 +938,17 @@ export class WebGpuSolver implements ClothSolver {
+     this.pushSimParams();
+   }
+ 
+-  /** G6C.2 batch-width schedule for one Newton round (static unroll). */
++  /** Batch-width schedule for one Newton round (static unroll). With
++   *  adaptiveK, the width follows the step's trial history (cold start uses
++   *  the configured default); otherwise the fixed armijoBatchK. */
+   private batchKsFor(): number[] {
+     const driver = this.driver!;
+-    const K0 = Math.max(1, Math.min(8, driver.cfg.armijoBatchK));
++    const last = this.trialHistory.length > 0
++      ? this.trialHistory[this.trialHistory.length - 1]
++      : null;
++    const K0 = driver.cfg.adaptiveK
++      ? adaptiveBatchK(last, driver.cfg.armijoBatchK)
++      : Math.max(1, Math.min(8, driver.cfg.armijoBatchK));
+     const Ks: number[] = [];
+     let rem = driver.cfg.armijoIters;
+     while (rem > 0) {
+@@ -982,7 +995,6 @@ export class WebGpuSolver implements ClothSolver {
+     if (evStatus.gradNorm < cfg.gradTol) {
+       converged = true;
+     } else {
+-      const batchKs = this.batchKsFor();
+       for (let k = 0; k < newtonIters; k++) {
+         newtonItersUsed++;
+         const submitsNewton0 = ex.ledger.submits;
+@@ -991,6 +1003,9 @@ export class WebGpuSolver implements ClothSolver {
+         const nst = new Float32Array(20);
+         nst[0] = k;
+         ex.writeBuffer("newtonStatus", nst);
++        // G6C.3 adaptive widths are re-predicted every round from the step's
++        // trial history (no syncs: history rides the per-round status read).
++        const batchKs = this.batchKsFor();
+         const st = await driver.newtonRound({
+           round: k,
+           beta: this.jacobiBeta(),
+@@ -1227,10 +1242,13 @@ export class WebGpuSolver implements ClothSolver {
+             this.lastDeviceStatus = { ...s, directionDotGradient: gtdx };
+             this.lastMarker = { mask: tev.markerMask, count: tev.markerCount };
+             accepted = true;
++            // G6C.3 history feed (same semantics as batched/GPU paths).
++            this.trialHistory.push(li);
+             break;
+           }
+           alpha *= 0.5;
+         }
++        if (!accepted) this.trialHistory.push(-1);
+       }
+       submitsPerNewton.push(ex.ledger.submits - submitsNewton0);
+       statusReadbacksPerNewton.push(this.hotLoopReadbacks - syncsNewton0);
+diff --git a/src/backend/webgpu/shaders/broadphase-sort.wgsl b/src/backend/webgpu/shaders/broadphase-sort.wgsl
+index 70101a2..0be562b 100644
+--- a/src/backend/webgpu/shaders/broadphase-sort.wgsl
++++ b/src/backend/webgpu/shaders/broadphase-sort.wgsl
+@@ -87,14 +87,37 @@ fn compareSwap(i : u32, nIn : u32, stageIn : u32, subIn : u32) {
+ fn sort_next(@builtin(global_invocation_id) gid : vec3u) {
+   if (gid.x + gid.y * 4194240u != 0u) { return; }
+   let t = sortCursor[0];
++  if (t >= sortCursor[1]) {
++    sortCursor[2] = 1u; // pass-count overrun; exposed to debug validation
++    return;
++  }
+   sortCursor[0] = t + 1u;
+ }
+ 
++// sort_reset: zero the pass cursor (lane 0) ahead of a rebuild. Replaces the
++// CPU writeBuffer reset so the whole sort — and the whole broadphase — stays
++// in one encoder with no control-write flush. Lane 1 carries T (pass count,
++// written once at upload); steps clamp to it so a transient/duplicated step
++// degrades to re-running the last pass (idempotent) instead of an OOB read.
++@compute @workgroup_size(64)
++fn sort_reset(@builtin(global_invocation_id) gid : vec3u) {
++  if (gid.x + gid.y * 4194240u != 0u) { return; }
++  sortCursor[0] = 0u;
++  sortCursor[2] = 0u;
++}
++
+ @compute @workgroup_size(64)
+ fn sort_step_indexed(@builtin(global_invocation_id) gid : vec3u) {
+   let i = gid.x + gid.y * 4194240u;
+-  // The matching sort_next already advanced the cursor past our pass.
+-  let t = sortCursor[0] - 1u;
++  // sort_next advances to t+1 before this dispatch. Refuse an unpaired step
++  // before subtracting, and latch the misuse in cursor lane 2 for diagnostics.
++  let cursor = sortCursor[0];
++  let hi = sortCursor[1];
++  if (cursor == 0u || hi == 0u || cursor > hi) {
++    if (i == 0u) { sortCursor[2] = 1u; }
++    return;
++  }
++  let t = cursor - 1u;
+   let prm = sortParams[t];
+   compareSwap(i, prm.x, prm.y, prm.z);
+ }
+diff --git a/src/backend/webgpu/shaders/newton-control.wgsl b/src/backend/webgpu/shaders/newton-control.wgsl
+index 4fe633a..a344c46 100644
+--- a/src/backend/webgpu/shaders/newton-control.wgsl
++++ b/src/backend/webgpu/shaders/newton-control.wgsl
+@@ -103,6 +103,9 @@ fn commit_arm(@builtin(global_invocation_id) gid : vec3u) {
+   if (gid.x + gid.y * 4194240u != 0u) { return; }
+   let b = caCtl[5]; // nbBatch counter (f32 holding u32, exact for small ints)
+   let bi = u32(b + 0.5);
++  // Cumulative trial base entering this batch (correct under varying batch
++  // widths, unlike bi*K — the hook adaptive-K will pull).
++  let base = u32(caCtl[7] + 0.5);
+   let localAccept = caBatch[0] > 0.5;
+   // sticky failure-flag ORs (per-batch counters would otherwise be lost)
+   if (caBatch[7] > 0.0) { caStatus[15] = 1.0; }
+@@ -117,7 +120,7 @@ fn commit_arm(@builtin(global_invocation_id) gid : vec3u) {
+     caCtl[4] = caBatch[1]; // nbAlpha (effective)
+     caCtl[6] = f32(bi); // nbAcceptBatch
+     let li = u32(caBatch[2] + 0.5); // local selected index
+-    caCtl[8] = f32(bi * caK + li); // global trial index
++    caCtl[8] = f32(base + li); // global trial index (cumulative base)
+     // merit BEFORE overwriting e0 (round-start energy minus accepted)
+     caStatus[11] = caE0[0] - caBatch[9];
+     caE0[0] = caBatch[9]; // latch accepted energy for later rounds
+@@ -126,7 +129,7 @@ fn commit_arm(@builtin(global_invocation_id) gid : vec3u) {
+     caStatus[14] = caBatch[14];
+   }
+   caCtl[5] = f32(bi + 1u);
+-  caCtl[7] = caCtl[7] + f32(caK); // nbTrialBase advance (exact for small ints)
++  caCtl[7] = f32(base + caK); // advance by THIS batch's width
+ }
+ 
+ // ---- commit_apply re-materializes xTrial at the LATCHED accepted alpha.
+@@ -164,7 +167,9 @@ fn commit_apply(@builtin(global_invocation_id) gid : vec3u) {
+ fn commit_copy_if(@builtin(global_invocation_id) gid : vec3u) {
+   let v = gid.x + gid.y * 4194240u;
+   if (v >= ccParams.vertexCount) { return; }
+-  if (ccCtl[3] < 0.5) { return; }
++  // nbAccepted (lane 2, sticky across batches), NOT per-batch doCommit:
++  // the single end-of-round commit fires iff ANY batch accepted.
++  if (ccCtl[2] < 0.5) { return; }
+   ccPos[v] = ccTrial[v];
+ }
+ 
+@@ -179,7 +184,8 @@ fn commit_copy_if(@builtin(global_invocation_id) gid : vec3u) {
+ fn commit_lagged_if(@builtin(global_invocation_id) gid : vec3u) {
+   let i = gid.x + gid.y * 4194240u;
+   if (i >= clParams.contactCount) { return; }
+-  if (clCtl[3] < 0.5) { return; }
++  // See commit_copy_if: sticky nbAccepted, not per-batch doCommit.
++  if (clCtl[2] < 0.5) { return; }
+   // Same body as contact-force commit_lagged (d>=dHat keeps stale entry).
+   let d = max(clDist[i], 1e-12);
+   let prm = clPrm[i];
+diff --git a/tests/webgpu/g6c-newton-parity.test.ts b/tests/webgpu/g6c-newton-parity.test.ts
+index 3bf0bf0..e8c865c 100644
+--- a/tests/webgpu/g6c-newton-parity.test.ts
++++ b/tests/webgpu/g6c-newton-parity.test.ts
+@@ -122,6 +122,18 @@ describe("G6C.2 Gate A full-iteration parity", () => {
+       },
+       batchKs, evalIndexBase: 300,
+     });
++    const trustGpu = new Float32Array(await ex.readBufferDebug("trustScaleStore", "gateA-trust", false))[0];
++    const gtdxGpu = new Float32Array(await ex.readBufferDebug("gtdxStore", "gateA-gtdx", false))[0];
++    const f32 = Math.fround;
++    const cpuRhs = evB.status.energy + 1e-4 * alphaA * st.trustScale * st.gtdx;
++    const gpuRhs = f32(evB.status.energy + f32(f32(1e-4 * rb.selectedAlpha) * gtdxGpu));
++    const bits = (x: number): string => new DataView(Float32Array.of(x).buffer).getUint32(0).toString(16).padStart(8, "0");
++    console.log(`[g6c-trust] scale cpu=${st.trustScale.toPrecision(10)} f32=${f32(st.trustScale).toPrecision(10)} ` +
++      `gpu=${trustGpu.toPrecision(10)} bits=${bits(f32(st.trustScale))}/${bits(trustGpu)}; ` +
++      `gtdx cpu=${st.gtdx.toPrecision(10)} gpu=${gtdxGpu.toPrecision(10)} bits=${bits(st.gtdx)}/${bits(gtdxGpu)}; ` +
++      `alphaEff cpu=${(alphaA * st.trustScale).toPrecision(10)} gpu=${rb.selectedAlpha.toPrecision(10)} ` +
++      `bits=${bits(alphaA * st.trustScale)}/${bits(rb.selectedAlpha)}; ` +
++      `ArmijoRHS cpu64=${cpuRhs.toPrecision(12)} gpu32=${gpuRhs.toPrecision(12)} bits=${bits(cpuRhs)}/${bits(gpuRhs)}`);
+     const posB = new Float32Array(await ex.readBufferDebug("position", "gateA-posB", false));
+     // eslint-disable-next-line no-console
+     console.log(`[g6c-gateA] seq alpha=${alphaA.toExponential(3)} gpu alpha=${rb.selectedAlpha.toExponential(3)} ` +
+diff --git a/tests/webgpu/g6c-sort.test.ts b/tests/webgpu/g6c-sort.test.ts
+index e9dba38..b567789 100644
+--- a/tests/webgpu/g6c-sort.test.ts
++++ b/tests/webgpu/g6c-sort.test.ts
+@@ -25,7 +25,7 @@ function mulberry32(seed: number): () => number {
+ /** Seed keys/payload (tail INF), run one sort path, read both buffers back. */
+ async function runSortPath(
+   fix: DeviceFixture, keys: Uint32Array, indexed: boolean,
+-): Promise<{ keys: Uint32Array; payload: Uint32Array; submits: number; passes: number }> {
++): Promise<{ keys: Uint32Array; payload: Uint32Array; cursor: Uint32Array; submits: number; passes: number }> {
+   const { ex, driver } = fix;
+   ex.writeBuffer("mortonKeys", keys);
+   const P = keys.length;
+@@ -45,9 +45,11 @@ async function runSortPath(
+   }
+   const kRaw = await ex.readBufferDebug("mortonKeys", "sort-keys", false);
+   const pRaw = await ex.readBufferDebug("mortonPayload", "sort-payload", false);
++  const cRaw = await ex.readBufferDebug("sortCursor", "sort-cursor", false);
+   return {
+     keys: new Uint32Array(kRaw),
+     payload: new Uint32Array(pRaw),
++    cursor: new Uint32Array(cRaw),
+     submits: ex.ledger.submits - s0,
+     passes: ex.ledger.passes - p0,
+   };
+@@ -91,6 +93,8 @@ describe("G6C.1 indexed sort", () => {
+     const indexed = await runSortPath(strip, Uint32Array.from(keys), true);
+     expect([...indexed.keys]).toEqual([...legacy.keys]);
+     expect([...indexed.payload]).toEqual([...legacy.payload]);
++    const T = Math.log2(P) * (Math.log2(P) + 1) / 2;
++    expect([...indexed.cursor.slice(0, 3)]).toEqual([T, T, 0]);
+     // eslint-disable-next-line no-console
+     console.log(`[g6c-sort] A/B exact over ${P} lanes; submits legacy=${legacy.submits} indexed=${indexed.submits} ` +
+       `passes legacy=${legacy.passes} indexed=${indexed.passes}`);
