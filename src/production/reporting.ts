@@ -10,7 +10,7 @@ import { placedPolygon } from "../marker/nest.js";
 
 export type ArtifactState = "current" | "stale" | "missing" | "invalid";
 export type ProductionArtifactKind =
-  | "pattern" | "grading" | "engineering" | "marker" | "bom" | "run" | "tech-pack" | "package" | "production-package";
+  | "pattern" | "grading" | "engineering" | "marker" | "bom" | "run" | "tech-pack" | "package" | "production-package" | "cut-plan";
 
 export interface DependencyArtifact {
   id: string;

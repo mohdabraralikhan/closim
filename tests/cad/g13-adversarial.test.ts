@@ -165,7 +165,9 @@ describe("G13E grading attacks", () => {
     const pkg = exportCommercialPackage(f.document, f.seams, f.set, {
       garmentName: "asym", grading: asymmetric, formats: ["dxf"],
     });
-    const rules = JSON.parse(decode(pkg.files.find((x) => x.role === "grade-rules")!.bytes));
+    const rules = JSON.parse(decode(pkg.files.find((x) => x.role === "grade-rules")!.bytes)) as {
+      rules: Array<{ deltas: Record<string, [number, number]> }>;
+    };
     const xxlDelta = rules.rules.flatMap((r: { deltas: Record<string, [number, number]> }) => Object.values(r.deltas))
       .find(([dx]) => Math.abs(dx + 0.031) < 1e-12);
     expect(xxlDelta).toBeDefined();
