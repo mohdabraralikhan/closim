@@ -1,0 +1,1396 @@
+﻿diff --git a/src/backend/webgpu/gpu-executor.ts b/src/backend/webgpu/gpu-executor.ts
+index 11c4d55..be516a8 100644
+--- a/src/backend/webgpu/gpu-executor.ts
++++ b/src/backend/webgpu/gpu-executor.ts
+@@ -45,6 +45,19 @@ export interface BindEntry {
+   size?: number;
+ }
+ 
++export type GpuFailureReason = "validation-error" | "out-of-memory" | "device-lost";
++
++/** A compact device-path failure that must never be decoded as solver status. */
++export class GpuExecutionFailure extends Error {
++  constructor(
++    readonly reason: GpuFailureReason,
++    message: string,
++  ) {
++    super(message.slice(0, 800));
++    this.name = "GpuExecutionFailure";
++  }
++}
++
+ export interface SyncLedger {
+   submits: number;
+   passes: number;
+@@ -105,6 +118,17 @@ export class GpuExecutor {
+   private tsResolve: any = null;
+   private tsLabels: string[] = [];
+   private tsMaxQueries = 0;
++  /** One-time pipeline checks and step scopes are enabled outside production. */
++  readonly validationCaptureEnabled = (() => {
++    const runtime = globalThis as typeof globalThis & {
++      process?: { env?: { NODE_ENV?: string } };
++      __CLOTH_DEV__?: boolean;
++    };
++    const nodeEnv = runtime.process?.env?.NODE_ENV;
++    return nodeEnv !== undefined ? nodeEnv !== "production" : runtime.__CLOTH_DEV__ === true;
++  })();
++  private validationScopeDepth = 0;
++  private deviceFailure: GpuExecutionFailure | null = null;
+ 
+   private constructor(device: any, facts: DeviceFacts, usage: Record<string, number>, mapMode: { READ: number }) {
+     this.device = device;
+@@ -188,13 +212,50 @@ export class GpuExecutor {
+         })(),
+         subgroups: features.includes("subgroups"),
+       };
+-      return new GpuExecutor(device, facts, usageBits(loaded.globals), mapModeBits(loaded.globals));
++      const exec = new GpuExecutor(device, facts, usageBits(loaded.globals), mapModeBits(loaded.globals));
++      exec.attachValidationListener();
++      return exec;
+     } catch {
+       return null;
+     }
+   }
+ 
+-  // ---- buffers ----
++  /** Attach the uncaptured-error listener (called once at create). */
++  attachValidationListener(): void {
++    const dev = this.device as any;
++    if (!dev) return;
++    this.validationScopesSupported =
++      typeof dev.pushErrorScope === "function" && typeof dev.popErrorScope === "function";
++    try {
++      const lost = dev.lost;
++      if (lost && typeof lost.then === "function") {
++        void lost.then((info: any) => {
++          const message = String(info?.message ?? info?.reason ?? "WebGPU device lost");
++          this.deviceFailure = new GpuExecutionFailure("device-lost", message);
++          this.uncapturedErrors.push({ type: "device-lost", message: message.slice(0, 400) });
++        }).catch((err: unknown) => {
++          this.deviceFailure = new GpuExecutionFailure("device-lost", String(err));
++        });
++      }
++    } catch { /* device.lost may be unavailable in a test double */ }
++    const record = (e: any): void => {
++      try {
++        const error = (e as any)?.error;
++        const type = String(
++          error?.errorType ?? error?.name ?? error?.constructor?.name ?? (e as any)?.type ?? "uncapturederror",
++        );
++        const message = String((e as any)?.error?.message ?? (e as any)?.message ?? e).slice(0, 400);
++        this.uncapturedErrors.push({ type, message });
++      } catch { /* a listener must never throw */ }
++    };
++    try {
++      if (typeof dev.addEventListener === "function") {
++        dev.addEventListener("uncapturederror", record);
++      } else {
++        try { dev.onuncapturederror = record; } catch { /* best effort */ }
++      }
++    } catch { /* best effort */ }
++  }
+ 
+   ensureBuffer(name: string, bytes: number, usage: number, label?: string): any {
+     const have = this.buffers.get(name);
+@@ -232,6 +293,10 @@ export class GpuExecutor {
+     // GPU write can stale this cache) skips identical rewrites, letting the
+     // open batch extend across passes. Everything else always flushes:
+     // STORAGE buffers may hold GPU-written results a rewrite must not hide.
++    // GLOBAL INVARIANT (G6C): no shader in this codebase writes a UNIFORM
++    // buffer or bank slot. If one ever does, this cache silently returns
++    // stale values — grep for `var<uniform>` write targets before adding any
++    // storage-write to a uniform-bound buffer.
+     const bytes = new Uint8Array((data as any).buffer, (data as any).byteOffset, (data as any).byteLength);
+     if ((name === this.uniformBankName || name === "simParams") && bytes.byteLength <= 256) {
+       const key = `${name}@${offset}`;
+@@ -304,6 +369,7 @@ export class GpuExecutor {
+   /** Eagerly compile every registered shader entry (init-time validation). */
+   async validateAllShaders(): Promise<{ ok: boolean; failures: string[] }> {
+     const failures: string[] = [];
++    this.pushValidationScope();
+     for (const [shader, entries] of Object.entries(SHADER_ENTRY_POINTS)) {
+       for (const entry of entries) {
+         try {
+@@ -325,6 +391,11 @@ export class GpuExecutor {
+         }
+       }
+     }
++    try {
++      await this.popValidationScope("pipeline-initialization");
++    } catch (err) {
++      failures.push(err instanceof Error ? err.message.slice(0, 800) : String(err).slice(0, 800));
++    }
+     return { ok: failures.length === 0, failures };
+   }
+ 
+@@ -509,6 +580,108 @@ export class GpuExecutor {
+     return "uniformBank";
+   }
+ 
++  /** Uncaptured WebGPU errors observed on this device (dev/test mechanism:
++   *  a poisoned queue can leave status buffers stale/zero, which decodes as
++   *  convergence — these must surface loudly instead). Drained by
++   *  popValidationScope / consumeUncapturedErrors. */
++  uncapturedErrors: Array<{ type: string; message: string }> = [];
++  /** True when device.pushErrorScope/popErrorScope exist (else no-op). */
++  validationScopesSupported = false;
++  /** Push validation and out-of-memory scopes. Scope work is one per device
++   *  step or initialization, never per dispatch. */
++  pushValidationScope(): void {
++    if (!this.validationCaptureEnabled || !this.validationScopesSupported) return;
++    try {
++      (this.device as any)?.pushErrorScope?.("out-of-memory");
++      (this.device as any)?.pushErrorScope?.("validation");
++      this.validationScopeDepth++;
++    } catch { /* scope tracking is best-effort; listener still records */ }
++  }
++
++  /**
++   * Pop one validation scope: any error captured between push and pop is
++   * recorded in uncapturedErrors AND thrown, so a poisoned batch can never
++   * decode a stale/zero status as convergence. Also drains errors the
++   * uncaptured listener observed in the window.
++   */
++  async popValidationScope(label: string): Promise<void> {
++    if (this.validationScopeDepth <= 0) {
++      this.assertDeviceHealthy(label);
++      this.assertNoUncapturedErrors(label);
++      return;
++    }
++    this.validationScopeDepth--;
++    let validationErr: any = null;
++    let oomErr: any = null;
++    try {
++      validationErr = await (this.device as any)?.popErrorScope?.();
++    } catch (err) {
++      validationErr = err;
++    }
++    try {
++      oomErr = await (this.device as any)?.popErrorScope?.();
++    } catch (err) {
++      oomErr = err;
++    }
++    const scopeErr = oomErr ?? validationErr;
++    if (scopeErr) {
++      const type = oomErr ? "out-of-memory" : "validation-error";
++      const message = `${label}: ${String((scopeErr as any)?.message ?? scopeErr)}`;
++      const failure = new GpuExecutionFailure(type, message);
++      this.deviceFailure = failure;
++      this.uncapturedErrors.length = 0;
++      throw failure;
++    }
++    this.assertDeviceHealthy(label);
++    this.assertNoUncapturedErrors(label);
++  }
++
++  /** Run a whole device operation under one pair of scopes in debug/test mode. */
++  async withValidationScope<T>(label: string, operation: () => Promise<T>): Promise<T> {
++    this.assertDeviceHealthy(label);
++    this.pushValidationScope();
++    let value!: T;
++    let operationErr: unknown;
++    let operationFailed = false;
++    try {
++      value = await operation();
++    } catch (err) {
++      operationFailed = true;
++      operationErr = err;
++    }
++    try {
++      await this.popValidationScope(label);
++    } catch (scopeErr) {
++      throw scopeErr;
++    }
++    if (operationFailed) throw operationErr;
++    return value;
++  }
++
++  assertDeviceHealthy(context: string): void {
++    if (this.deviceFailure) {
++      throw new GpuExecutionFailure(this.deviceFailure.reason, `${context}: ${this.deviceFailure.message}`);
++    }
++  }
++
++  /** Throw if the uncaptured listener observed errors since the last drain. */
++  assertNoUncapturedErrors(context: string): void {
++    if (this.uncapturedErrors.length === 0) return;
++    const errs = this.uncapturedErrors.splice(0, this.uncapturedErrors.length);
++    const reason: GpuFailureReason = errs.some((e) => /out.?of.?memory/i.test(e.type))
++      ? "out-of-memory"
++      : errs.some((e) => e.type === "device-lost") ? "device-lost" : "validation-error";
++    const failure = new GpuExecutionFailure(reason,
++      `${context}: ` + errs.map((e) => `[${e.type}] ${e.message}`).join(" | ").slice(0, 700));
++    this.deviceFailure = failure;
++    throw failure;
++  }
++
++  /** Drain and return pending uncaptured errors without throwing (tests). */
++  consumeUncapturedErrors(): Array<{ type: string; message: string }> {
++    return this.uncapturedErrors.splice(0, this.uncapturedErrors.length);
++  }
++
+   /** Write one 16 B uniform-bank slot (f32[4] payload). */
+   writeBankSlot(slot: number, f: [number, number, number, number]): void {
+     this.writeBuffer(this.uniformBankName, new Float32Array(f), slot * UNIFORM_SLOT_STRIDE);
+diff --git a/src/backend/webgpu/gpu-newton.ts b/src/backend/webgpu/gpu-newton.ts
+index 6784c52..752933f 100644
+--- a/src/backend/webgpu/gpu-newton.ts
++++ b/src/backend/webgpu/gpu-newton.ts
+@@ -139,6 +139,16 @@ export function adaptiveBatchK(lastTrial: number | null, defaultK: number): numb
+   return 8;
+ }
+ 
++/**
++ * G6C.3 global trial index from a batch's local selection (pure; unit-tested).
++ * trialsBefore is the sum of ALL earlier batch widths (NOT batchIndex * width:
++ * that identity only holds for uniform widths). The device-side commit_arm
++ * tracks the same cumulative base in newtonCtl[7] for the identical reason.
++ */
++export function globalTrialIndex(trialsBefore: number, localIndex: number): number {
++  return trialsBefore + localIndex;
++}
++
+ /** G6C.2 compact Newton-round status (one 80 B read per round). */
+ export interface NewtonRoundStatus {
+   iteration: number;
+@@ -449,14 +459,19 @@ export class DeviceNewtonDriver {
+   /** G6C.1 indexed sort: identical Batcher network, zero per-pass CPU
+    *  uniforms. The cursor/triples walk the same (k,j) sequence the legacy
+    *  loop would issue (see bitonicPassAt); all T sub-passes stay in flight
+-   *  with no added submits. sortParams uploaded once per scene. */
++   *  with no added submits. sortParams uploaded once per scene. The cursor
++   *  reset is itself a GPU pass (no control-write flush); lane 1 carries T
++   *  so a stray step clamps instead of reading out of bounds. */
+   sortPassesIndexed(): void {
+     const m = this.c.m;
+     const P = nextPow2(Math.max(m, 1));
+     const stages = Math.log2(P);
+     const T = (stages * (stages + 1)) / 2;
+-    // Cursor reset (one control write before the batch opens work).
+-    this.ex.writeBuffer("sortCursor", new Uint32Array([0, 0, 0, 0]));
++    this.ex.runPass({
++      shader: "broadphase-sort", entry: "sort_reset",
++      groups: [[B(6, "sortCursor")]],
++      x: 1,
++    });
+     for (let t = 0; t < T; t++) {
+       this.ex.runPass({
+         shader: "broadphase-sort", entry: "sort_next",
+@@ -1748,16 +1763,18 @@ export class DeviceNewtonDriver {
+    *  The caller must have run rhsAt(srcBuf) first so rhs is state-consistent.
+    */
+   async diagnosticsAt(srcBuf = "xTrial"): Promise<{ status: SolverStatus; markerMask: number; markerCount: number }> {
+-    this.ex.beginBatch("diagnostics");
+-    this.diagnosticsPasses(srcBuf);
+-    this.flushMarks();
+-    await this.ex.submitBatch(false);
+-    // SYNC POINT: 64 B status + 16 B marker in one pack (two tiny maps).
+-    const sRaw = await this.ex.readSmall("solverStatus", 64, "newton-status", "status");
+-    const mRaw = await this.ex.readSmall("execMarker", 16, "exec-marker", "status");
+-    const status = decodeSolverStatus(sRaw);
+-    const mu = new Uint32Array(mRaw);
+-    return { status, markerMask: mu[2], markerCount: mu[3] };
++    return this.ex.withValidationScope("newton-diagnostics", async () => {
++      this.ex.beginBatch("diagnostics");
++      this.diagnosticsPasses(srcBuf);
++      this.flushMarks();
++      await this.ex.submitBatch(false);
++      // SYNC POINT: 64 B status + 16 B marker in one pack (two tiny maps).
++      const sRaw = await this.ex.readSmall("solverStatus", 64, "newton-status", "status");
++      const mRaw = await this.ex.readSmall("execMarker", 16, "exec-marker", "status");
++      const status = decodeSolverStatus(sRaw);
++      const mu = new Uint32Array(mRaw);
++      return { status, markerMask: mu[2], markerCount: mu[3] };
++    });
+   }
+ 
+   /** G6B per-candidate trial evaluation inside the caller's batch (no submits,
+@@ -1812,7 +1829,23 @@ export class DeviceNewtonDriver {
+   /** G6B sync-free trial rebuild (Batch A + Batch B encode, no submit, no
+    *  reads): refreshes records/gradient/rhs at the current xTrial for commit.
+    *  Cap-bounded (contactCount uniform stays at cap); sentinel-cleared tail
+-   *  slots are inert by the barrier/friction guards. */
++   *  slots are inert by the barrier/friction guards.
++   *
++   *  S1 (round-boundary sync): the clear is STRUCTURAL here, not caller
++   *  hygiene. Traverse/expand/compact append via atomics onto the live
++   *  counters; without a clear the rebuild appends the commit state's records
++   *  AFTER the last candidate trial's records (count doubles), and the
++   *  cap-bounded force/friction assembly then mixes two states into the
++   *  gradient that the next round's rhsJacobi reads. Clearing first makes the
++   *  post-commit buffers describe xTrial — and after the predicated copy,
++   *  position — by construction.
++   *
++   *  Precondition: simParams.contactCount must be cap here (both commit paths
++   *  hold it: the G6B batch prologue and the GPU-control step prologue set
++   *  cap-bounded loops, restored to the live count only by the next
++   *  evaluateNewtonState). The record clear is bounded by that uniform, so a
++   *  live count would leave stale tail slots that cap-bounded force/friction
++   *  assembly still reads. */
+   rebuildTrialPasses(
+     mat: { c00: number; c11: number; c01: number; g: number; thickness: number },
+     contact: {
+@@ -1820,6 +1853,7 @@ export class DeviceNewtonDriver {
+       floorY: number; floorOn: number; dMin: number; contactCapacity: number;
+     },
+   ): void {
++    this.armijoClearPass();
+     this.broadphasePasses(0.002, true);
+     this.contactPasses(contact, "xTrial");
+     this.femPasses(mat, true);
+@@ -1890,9 +1924,13 @@ export class DeviceNewtonDriver {
+     this.bankF(GpuUniformSlot.ArmijoPcgBd, opts.pcgBreakdown ? 1 : 0);
+     this.bankF(GpuUniformSlot.ArmijoNewtonConv, opts.newtonConverged ? 1 : 0);
+     this.resetMarker(opts.evalIndexBase + 1);
++    this.ex.pushValidationScope();
+     this.ex.beginBatch("armijo-batch");
+     this.armijoBatchPasses(K, opts.mat, opts.contact, opts.evalIndexBase);
+     await this.ex.submitBatch(false);
++    // Validation gate BEFORE the status read: a poisoned batch must throw
++    // here rather than decode a stale/zero status as convergence/reject.
++    await this.ex.popValidationScope("armijo-batch");
+     // THE one status readback per batch (labeled SYNC POINT).
+     const raw = await this.ex.readSmall("armijoStatus", 64, "armijo-status", "status");
+     return decodeArmijoStatus(raw);
+@@ -1938,6 +1976,8 @@ export class DeviceNewtonDriver {
+     const nst = new Float32Array(20);
+     nst[0] = opts.round;
+     this.ex.writeBuffer("newtonStatus", nst);
++    // Validation scope for the whole round (popped before the status read).
++    this.ex.pushValidationScope();
+     this.ex.beginBatch("newton-round");
+     // 1. Xk refresh at the accepted position (records current post-commit;
+     //    round 0 reuses the E0 evaluation's records the same way).
+@@ -1967,7 +2007,46 @@ export class DeviceNewtonDriver {
+       groups: [[B(1, "reduceScratch"), B(3, "gtdxStore")]],
+       x: 1,
+     });
+-    // 5. Trust scale from the device-side max (reduce_max passes, no read).
++    // 5. Descent fallback selection, fully GPU-side.
++    this.ex.writeBlas(this.n3, 1);
++    this.ex.runPass({
++      shader: "blas", entry: "neg_div",
++      groups: [[this.blasBank(), B(1, "rhs"), B(2, "diag"), B(3, "descentDir")]],
++      x: this.w(this.n3),
++    });
++    this.ex.runPass({
++      shader: "newton-control", entry: "descent_check",
++      groups: [[
++        B(30, "gtdxStore"), B(31, "breakFlag"), B(32, "newtonCtl"), B(33, "newtonStatus"),
++      ]],
++      x: 1,
++    });
++    this.ex.runPass({
++      shader: "newton-control", entry: "select_fallback",
++      groups: [[
++        B(40, "descentDir"), B(41, "searchDirection"), B(42, "newtonCtl"),
++        B(43, "simParams"),
++      ]],
++      x: this.w(this.n3),
++    });
++    // Recompute metrics from the direction that will actually be searched.
++    // descent_check needs the PCG dot above, but select_fallback may replace
++    // that vector; retaining its dot or max would apply the wrong Armijo
++    // slope and trust scale to the fallback direction.
++    this.ex.writeBlas(this.n3, 1);
++    this.ex.runPass({
++      shader: "blas", entry: "mul",
++      groups: [[this.blasBank(), B(1, "rhs"), B(2, "searchDirection"), B(3, "pcgProd")]],
++      x: this.w(this.n3),
++    });
++    this.reduceIntoScratch("pcgProd", this.n3, this.w(this.n3));
++    this.ex.runPass({
++      shader: "blas", entry: "scopy",
++      groups: [[B(1, "reduceScratch"), B(3, "gtdxStore")]],
++      x: 1,
++    });
++    // Trust scale must likewise describe the selected direction, including
++    // the Jacobi fallback, rather than the discarded PCG vector.
+     this.ex.writeBlas(this.n3, 1);
+     this.ex.runPass({
+       shader: "blas", entry: "absv",
+@@ -2003,30 +2082,11 @@ export class DeviceNewtonDriver {
+       ]],
+       x: 1,
+     });
+-    // 6. Descent fallback selection, fully GPU-side.
+-    this.ex.writeBlas(this.n3, 1);
+-    this.ex.runPass({
+-      shader: "blas", entry: "neg_div",
+-      groups: [[this.blasBank(), B(1, "rhs"), B(2, "diag"), B(3, "descentDir")]],
+-      x: this.w(this.n3),
+-    });
+-    this.ex.runPass({
+-      shader: "newton-control", entry: "descent_check",
+-      groups: [[
+-        B(30, "gtdxStore"), B(31, "breakFlag"), B(32, "newtonCtl"), B(33, "newtonStatus"),
+-      ]],
+-      x: 1,
+-    });
+-    this.ex.runPass({
+-      shader: "newton-control", entry: "select_fallback",
+-      groups: [[
+-        B(40, "descentDir"), B(41, "searchDirection"), B(42, "newtonCtl"),
+-        B(43, "simParams"),
+-      ]],
+-      x: this.w(this.n3),
+-    });
+-    // 7. B Armijo batches with predicated commit (per-batch CPU param writes
+-    //    flush only — no syncs; the loop always runs all slots (bounded)).
++    // 7. B Armijo batches with first-accept arbitration (per-batch CPU param
++    //    writes flush only — no syncs; the loop always runs all slots
++    //    (bounded)). Commit happens ONCE after the loop (see below), so
++    //    position never advances mid-round and later batches evaluate from
++    //    the round-start state exactly like the sequential solver.
+     let trialBase = 0;
+     for (let b = 0; b < opts.batchKs.length; b++) {
+       const K = opts.batchKs[b];
+@@ -2044,7 +2104,7 @@ export class DeviceNewtonDriver {
+         this.armijoTrialPasses(j, opts.mat, opts.contact, opts.evalIndexBase + trialBase + j);
+       }
+       this.armijoSelectPass();
+-      // commit arbitration + refresh + predicated commit
++      // First-accept arbitration only (no commit yet — see step 7b).
+       this.ex.runPass({
+         shader: "newton-control", entry: "commit_arm",
+         groups: [[
+@@ -2054,46 +2114,54 @@ export class DeviceNewtonDriver {
+         ]],
+         x: 1,
+       });
+-      // Commit refresh: re-materialize xTrial at the latched alpha, rebuild
+-      // records there, then predicated copy. (Without the re-apply, xTrial
+-      // would still hold the last candidate — not necessarily accepted.)
+-      this.ex.runPass({
+-        shader: "newton-control", entry: "commit_apply",
+-        groups: [[
+-          B(64, "position"), B(65, "searchDirection"), B(66, "xTrial"),
+-          B(67, "pinMask"), B(68, "pinPos"), B(69, "newtonCtl"),
+-        ]],
+-        x: this.w(this.c.n),
+-      });
+-      this.rebuildTrialPasses(opts.mat, opts.contact);
+-      this.ex.runPass({
+-        shader: "newton-control", entry: "commit_copy_if",
+-        groups: [[
+-          B(60, "xTrial"), B(61, "position"), B(62, "newtonCtl"),
+-          B(63, "simParams"),
+-        ]],
+-        x: this.w(this.c.nExt),
+-      });
+-      this.ex.runPass({
+-        shader: "newton-control", entry: "commit_lagged_if",
+-        groups: [[
+-          B(70, "contactN"), B(71, "contactDist"), B(72, "contactPrm"),
+-          B(73, "laggedN"), B(74, "newtonCtl"), B(75, "simParams"),
+-        ]],
+-        x: this.w(Math.max(this.c.cap, 1)),
+-      });
+       trialBase += K;
+     }
++    // 7b. Single end-of-round commit: re-materialize xTrial at the latched
++    // alpha, rebuild records there, then predicated copy. Position moves at
++    // most once per round, so records stay in sync with position by
++    // construction (S1: the old per-batch commit desynced them on
++    // accept-then-reject).
++    this.ex.runPass({
++      shader: "newton-control", entry: "commit_apply",
++      groups: [[
++        B(64, "position"), B(65, "searchDirection"), B(66, "xTrial"),
++        B(67, "pinMask"), B(68, "pinPos"), B(69, "newtonCtl"),
++      ]],
++      x: this.w(this.c.n),
++    });
++    this.rebuildTrialPasses(opts.mat, opts.contact);
++    this.ex.runPass({
++      shader: "newton-control", entry: "commit_copy_if",
++      groups: [[
++        B(60, "xTrial"), B(61, "position"), B(62, "newtonCtl"),
++        B(63, "simParams"),
++      ]],
++      x: this.w(this.c.nExt),
++    });
++    this.ex.runPass({
++      shader: "newton-control", entry: "commit_lagged_if",
++      groups: [[
++        B(70, "contactN"), B(71, "contactDist"), B(72, "contactPrm"),
++        B(73, "laggedN"), B(74, "newtonCtl"), B(75, "simParams"),
++      ]],
++      x: this.w(Math.max(this.c.cap, 1)),
++    });
++    // Marker evidence per round (1 pass + the bankU flush, no syncs): without
++    // this, marks accumulated inside the round would never reach execMarker.
++    this.flushMarks();
+     // 8. Round report + the single status readback per round.
+     this.ex.runPass({
+       shader: "newton-control", entry: "round_report",
+       groups: [[
+         B(90, "newtonCtl"), B(91, "newtonStatus"), B(92, "gtdxStore"),
+-        B(93, "e0Store"), B(94, "armijoStatus"),
++        B(93, "e0Store"),
+       ]],
+       x: 1,
+     });
+     await this.ex.submitBatch(false);
++    // Validation gate BEFORE the status read: a poisoned round must throw
++    // here rather than decode a stale/zero status as convergence/failure.
++    await this.ex.popValidationScope("newton-round");
+     const raw = await this.ex.readSmall("newtonStatus", 80, "newton-status", "status");
+     return decodeNewtonStatus(raw);
+   }
+diff --git a/src/backend/webgpu/gpu-pipelines.ts b/src/backend/webgpu/gpu-pipelines.ts
+index a264b67..4aaf3c7 100644
+--- a/src/backend/webgpu/gpu-pipelines.ts
++++ b/src/backend/webgpu/gpu-pipelines.ts
+@@ -79,7 +79,7 @@ export const SHADER_ENTRY_POINTS: Record<ShaderName, string[]> = {
+   "barrier-hvp": ["barrier_hvp_project", "assemble_barrier_hvp", "contact_diag"],
+   "broadphase-aabb": ["main"],
+   "broadphase-morton": ["main"],
+-  "broadphase-sort": ["bitonic_sort_step", "sort_next", "sort_step_indexed"],
++  "broadphase-sort": ["bitonic_sort_step", "sort_next", "sort_reset", "sort_step_indexed"],
+   "broadphase-lbvh": ["lbvh_seed_leaves", "lbvh_build", "lbvh_find_root", "lbvh_refit"],
+   "broadphase-traverse": ["traverse"],
+   "closest-vt": ["closest_vt"],
+diff --git a/src/backend/webgpu/gpu-solver.ts b/src/backend/webgpu/gpu-solver.ts
+index 8a06da6..b51e234 100644
+--- a/src/backend/webgpu/gpu-solver.ts
++++ b/src/backend/webgpu/gpu-solver.ts
+@@ -35,7 +35,7 @@ import type { BroadPhase, CandidatePairs } from "../../collision/broadphase.js";
+ import {
+   GpuContactSystem, type GpuContactSet, type GpuContactDiagnostics,
+ } from "./gpu-contact.js";
+-import { GpuExecutor } from "./gpu-executor.js";
++import { GpuExecutionFailure, GpuExecutor, type GpuFailureReason } from "./gpu-executor.js";
+ import { DeviceNewtonDriver, DEFAULT_NEWTON_CONFIG } from "./gpu-newton.js";
+ import { GpuUniformSlot, UNIFORM_SLOT_STRIDE, nextPow2 } from "./gpu-buffers.js";
+ import { buildAdjacencyExclusions } from "../../collision/bvh.js";
+@@ -45,7 +45,8 @@ import { buildCoarsePattern, type CoarsePattern } from "../../solver/coarse-csr.
+ import { bitonicPassAt } from "./gpu-broadphase.js";
+ import { COARSE_MAX_DEGREE } from "./gpu-buffers.js";
+ import {
+-  applyPreconditionerMode, type PreconditionerMode, type PreconditionerFallback,
++  applyPreconditionerMode, adaptiveBatchK, globalTrialIndex,
++  type PreconditionerMode, type PreconditionerFallback,
+ } from "./gpu-newton.js";
+ 
+ /** G6A per-step production report: separates fixed-state solver evidence
+@@ -83,6 +84,18 @@ export interface GpuDiagnostics extends SolverStatus {
+   submitMs: number;
+   readbackMs: number;
+   statusBytes: number;
++  /** A failed device step is distinct from a finite CPU fallback status. */
++  failed?: boolean;
++  failureReason?: GpuFailureReason | null;
++  requestedPath?: "GPU" | "CPU";
++  actualPath?: "GPU" | "CPU";
++  fallbackReason?: string | null;
++}
++
++export interface DevicePathAccounting {
++  requested: "GPU";
++  actual: "GPU" | "CPU";
++  fallbackReason: GpuFailureReason | null;
+ }
+ 
+ export interface GpuBenchmarkSample {
+@@ -170,6 +183,9 @@ export class WebGpuSolver implements ClothSolver {
+   fallbackLog: PreconditionerFallback[] = [];
+   /** Per-step report from the most recent device step (see StepPreconditionerReport). */
+   lastStepReport: StepPreconditionerReport | null = null;
++  /** Most recent GPU request's actual execution path and compact failure code. */
++  lastDevicePath: DevicePathAccounting = { requested: "GPU", actual: "GPU", fallbackReason: null };
++  private lastDeviceFailure: GpuExecutionFailure | null = null;
+ 
+   // ---- ClothSolver contract (sync; delegates to CPU until GPU stepping lands) ----
+   initialize(scene: ClothScene): void {
+@@ -558,6 +574,7 @@ export class WebGpuSolver implements ClothSolver {
+     }
+     // G6C.1 indexed-sort static table: (P, stage, sub, 0) per sub-pass t
+     // (depends only on mesh size; uploaded once, read by sort_step_indexed).
++    // sortCursor lane 1 carries T so steps can clamp defensively.
+     {
+       const P2 = nextPow2(Math.max(scene.mesh.triCount, 1));
+       const stages = Math.log2(P2);
+@@ -571,7 +588,7 @@ export class WebGpuSolver implements ClothSolver {
+         table[t * 4 + 3] = 0;
+       }
+       put("sortParams", table);
+-      put("sortCursor", new Uint32Array([0, 0, 0, 0]));
++      put("sortCursor", new Uint32Array([0, T, 0, 0]));
+     }
+     // exclusion keys as (lo,hi) vec2u pairs (G2 encoding, uploaded once)
+     {
+@@ -686,9 +703,22 @@ export class WebGpuSolver implements ClothSolver {
+     if (!this.scene) throw new Error("WebGpuSolver not initialized");
+     // G3: real device path when available (and not forced to mirror).
+     if (this.deviceMode === "device" && this.executor && this.driver && !this.forceMirror) {
+-      return this.stepGpuDevice(dt, opts);
++      const ex = this.executor;
++      this.lastDevicePath = { requested: "GPU", actual: "GPU", fallbackReason: null };
++      this.lastDeviceFailure = null;
++      try {
++        return await ex.withValidationScope("device-step", async () => {
++          const diagnostics = await this.stepGpuDevice(dt, opts);
++          ex.assertDeviceHealthy("device-step-complete");
++          return diagnostics;
++        });
++      } catch (err) {
++        if (!(err instanceof GpuExecutionFailure)) throw err;
++        return this.fallbackAfterDeviceFailure(dt, err);
++      }
+     }
+     this.fallbackUses++; // explicit CPU-fallback accounting (test 16)
++    this.lastDevicePath = { requested: "GPU", actual: "CPU", fallbackReason: null };
+     const newtonIters = opts.newtonIters ?? 10;
+     const tEnc0 = performance.now();
+     this.simParams!.dt = dt;
+@@ -719,6 +749,8 @@ export class WebGpuSolver implements ClothSolver {
+     this.readbackMs = tRb1 - tRb0;
+     return {
+       ...status,
++      failed: false, failureReason: null,
++      requestedPath: "GPU", actualPath: "CPU", fallbackReason: null,
+       deviceReady: this.handle?.ready ?? false,
+       timestampQuery: this.handle?.timestampQueryEnabled ?? false,
+       encodeMs: this.encodeMs, submitMs: this.submitMs, readbackMs: this.readbackMs,
+@@ -726,6 +758,32 @@ export class WebGpuSolver implements ClothSolver {
+     };
+   }
+ 
++  /** Validation/device failures invalidate the GPU status for this request.
++   *  Advance via the CPU golden solver, but never report that status as a
++   *  successful GPU Newton convergence. */
++  private fallbackAfterDeviceFailure(dt: number, failure: GpuExecutionFailure): GpuDiagnostics {
++    this.fallbackUses++;
++    this.lastDeviceFailure = failure;
++    this.lastDevicePath = { requested: "GPU", actual: "CPU", fallbackReason: failure.reason };
++    this.cpuFallback!.step(dt);
++    if (this.scene?.contact) enforcePins(this.scene, this.scene.positions);
++    const status = this.synthesizeStatus();
++    const failedStatus: SolverStatus = { ...status, finite: 0, converged: 0 };
++    this.lastDeviceStatus = failedStatus;
++    return {
++      ...failedStatus,
++      failed: true,
++      failureReason: failure.reason,
++      requestedPath: "GPU",
++      actualPath: "CPU",
++      fallbackReason: failure.reason,
++      deviceReady: false,
++      timestampQuery: this.executor?.facts.timestampQuery ?? false,
++      encodeMs: this.encodeMs, submitMs: 0, readbackMs: 0,
++      statusBytes: 64,
++    };
++  }
++
+   private synthesizeStatus(): SolverStatus {
+     // Headless stand-in for the diagnostics.wgsl 64 B payload: computed from
+     // the golden CPU state so parity tests exercise the same thresholds.
+@@ -796,40 +854,42 @@ export class WebGpuSolver implements ClothSolver {
+   ): Promise<{ status: SolverStatus; markerMask: number; markerCount: number; contactCount: number }> {
+     const ex = this.executor!;
+     const driver = this.driver!;
+-    const posBuf = atTrial ? "xTrial" : "position";
+-    driver.resetMarker(evalIndex + 1);
+-    driver.zeroContactCounters();
+-    // Batch A: broadphase + CCD/compaction (all GPU->GPU).
+-    ex.beginBatch(atTrial ? "eval-trial-contact" : "eval-contact");
+-    driver.broadphasePasses(0.002, atTrial);
+-    driver.contactPasses(this.contactParamsNow(), posBuf);
+-    await ex.submitBatch(false);
+-    // SYNC POINT (tiny): compacted contact count -> SimParams refresh.
+-    const contactCount = await driver.readContactCount();
+-    this.contactCountNow = contactCount;
+-    this.simImage.newtonIteration = evalIndex;
+-    this.pushSimParams();
+-    // Batch B: FEM + gradient + RHS/Jacobi at the same state.
+-    // (Trial evals also refresh rhs so diagnostics norms the trial-state
+-    // total residual, exactly like the CPU convergence check.)
+-    ex.beginBatch(atTrial ? "eval-trial-fem" : "eval-fem");
+-    driver.femPasses(this.materialNow(), atTrial);
+-    if (atTrial) {
+-      driver.contactDiagPass();
+-      driver.rhsAt("xTrial");
+-    } else {
+-      driver.rhsJacobi(this.jacobiBeta());
+-    }
+-    await ex.submitBatch(false);
+-    // Batch C: diagnostics + status/marker pack.
+-    const { status, markerMask, markerCount } = await driver.diagnosticsAt(posBuf);
+-    // Accounting: one compact (64 B status + 16 B marker) sync per evaluation.
+-    this.hotLoopReadbacks++;
+-    // Freshest device-execution evidence (every eval, accepted or not).
+-    this.lastMarker = { mask: markerMask, count: markerCount };
+-    void posBuf;
+-    void dt;
+-    return { status, markerMask, markerCount, contactCount };
++    return ex.withValidationScope("evaluate-newton-state", async () => {
++      const posBuf = atTrial ? "xTrial" : "position";
++      driver.resetMarker(evalIndex + 1);
++      driver.zeroContactCounters();
++      // Batch A: broadphase + CCD/compaction (all GPU->GPU).
++      ex.beginBatch(atTrial ? "eval-trial-contact" : "eval-contact");
++      driver.broadphasePasses(0.002, atTrial);
++      driver.contactPasses(this.contactParamsNow(), posBuf);
++      await ex.submitBatch(false);
++      // SYNC POINT (tiny): compacted contact count -> SimParams refresh.
++      const contactCount = await driver.readContactCount();
++      this.contactCountNow = contactCount;
++      this.simImage.newtonIteration = evalIndex;
++      this.pushSimParams();
++      // Batch B: FEM + gradient + RHS/Jacobi at the same state.
++      // (Trial evals also refresh rhs so diagnostics norms the trial-state
++      // total residual, exactly like the CPU convergence check.)
++      ex.beginBatch(atTrial ? "eval-trial-fem" : "eval-fem");
++      driver.femPasses(this.materialNow(), atTrial);
++      if (atTrial) {
++        driver.contactDiagPass();
++        driver.rhsAt("xTrial");
++      } else {
++        driver.rhsJacobi(this.jacobiBeta());
++      }
++      await ex.submitBatch(false);
++      // Batch C: diagnostics + status/marker pack.
++      const { status, markerMask, markerCount } = await driver.diagnosticsAt(posBuf);
++      // Accounting: one compact (64 B status + 16 B marker) sync per evaluation.
++      this.hotLoopReadbacks++;
++      // Freshest device-execution evidence (every eval, accepted or not).
++      this.lastMarker = { mask: markerMask, count: markerCount };
++      void posBuf;
++      void dt;
++      return { status, markerMask, markerCount, contactCount };
++    });
+   }
+ 
+   /** G6B per-step Armijo counters (reset at each stepGpuDevice entry). */
+@@ -912,11 +972,15 @@ export class WebGpuSolver implements ClothSolver {
+           pcgBreakdown: 0,
+           converged: 0,
+         };
+-        lastTrial = trialsUsed - K + st.selectedIndex;
++        lastTrial = globalTrialIndex(trialsUsed - K, st.selectedIndex);
++        // G6C.3 history feed (same semantics as the GPU-control path: global
++        // accepted trial index, -1 when the search exhausts the budget).
++        this.trialHistory.push(globalTrialIndex(trialsUsed - K, st.selectedIndex));
+         return { alpha: st.selectedAlpha / opts.trustScale, accepted: true, status };
+       }
+       alphaBase *= Math.pow(0.5, adv);
+     }
++    this.trialHistory.push(-1);
+     return { alpha: alphaBase, accepted: false, status: null };
+   }
+ 
+@@ -932,10 +996,17 @@ export class WebGpuSolver implements ClothSolver {
+     this.pushSimParams();
+   }
+ 
+-  /** G6C.2 batch-width schedule for one Newton round (static unroll). */
++  /** Batch-width schedule for one Newton round (static unroll). With
++   *  adaptiveK, the width follows the step's trial history (cold start uses
++   *  the configured default); otherwise the fixed armijoBatchK. */
+   private batchKsFor(): number[] {
+     const driver = this.driver!;
+-    const K0 = Math.max(1, Math.min(8, driver.cfg.armijoBatchK));
++    const last = this.trialHistory.length > 0
++      ? this.trialHistory[this.trialHistory.length - 1]
++      : null;
++    const K0 = driver.cfg.adaptiveK
++      ? adaptiveBatchK(last, driver.cfg.armijoBatchK)
++      : Math.max(1, Math.min(8, driver.cfg.armijoBatchK));
+     const Ks: number[] = [];
+     let rem = driver.cfg.armijoIters;
+     while (rem > 0) {
+@@ -982,7 +1053,6 @@ export class WebGpuSolver implements ClothSolver {
+     if (evStatus.gradNorm < cfg.gradTol) {
+       converged = true;
+     } else {
+-      const batchKs = this.batchKsFor();
+       for (let k = 0; k < newtonIters; k++) {
+         newtonItersUsed++;
+         const submitsNewton0 = ex.ledger.submits;
+@@ -991,6 +1061,9 @@ export class WebGpuSolver implements ClothSolver {
+         const nst = new Float32Array(20);
+         nst[0] = k;
+         ex.writeBuffer("newtonStatus", nst);
++        // G6C.3 adaptive widths are re-predicted every round from the step's
++        // trial history (no syncs: history rides the per-round status read).
++        const batchKs = this.batchKsFor();
+         const st = await driver.newtonRound({
+           round: k,
+           beta: this.jacobiBeta(),
+@@ -1112,6 +1185,7 @@ export class WebGpuSolver implements ClothSolver {
+         ev = await this.evaluateNewtonState(false, 1, dt);
+       }
+     }
++    this.assertNewtonStatusUsable(ev.status, "initial evaluation");
+     let E0 = ev.status.energy;
+     let gtdx0 = 0;
+     void gtdx0;
+@@ -1132,7 +1206,7 @@ export class WebGpuSolver implements ClothSolver {
+     } else {
+     for (let k = 0; k < newtonIters; k++) {
+       const st = k === 0 ? ev.status : (await this.evaluateXkAfterAccept()).status;
+-      void st;
++      this.assertNewtonStatusUsable(st, `Newton iteration ${k}`);
+       // Current gradient norm (from the latest diagnostics).
+       const gnorm = k === 0 ? ev.status.gradNorm : this.lastDeviceStatus!.gradNorm;
+       if (!Number.isFinite(gnorm)) throw new Error("device Newton: non-finite gradient");
+@@ -1227,10 +1301,13 @@ export class WebGpuSolver implements ClothSolver {
+             this.lastDeviceStatus = { ...s, directionDotGradient: gtdx };
+             this.lastMarker = { mask: tev.markerMask, count: tev.markerCount };
+             accepted = true;
++            // G6C.3 history feed (same semantics as batched/GPU paths).
++            this.trialHistory.push(li);
+             break;
+           }
+           alpha *= 0.5;
+         }
++        if (!accepted) this.trialHistory.push(-1);
+       }
+       submitsPerNewton.push(ex.ledger.submits - submitsNewton0);
+       statusReadbacksPerNewton.push(this.hotLoopReadbacks - syncsNewton0);
+@@ -1301,6 +1378,8 @@ export class WebGpuSolver implements ClothSolver {
+     }
+     return {
+       ...final,
++      failed: false, failureReason: null,
++      requestedPath: "GPU", actualPath: "GPU", fallbackReason: null,
+       deviceReady: true,
+       timestampQuery: ex.facts.timestampQuery,
+       encodeMs: this.encodeMs, submitMs: 0, readbackMs: 0,
+@@ -1329,6 +1408,13 @@ export class WebGpuSolver implements ClothSolver {
+     return { status: snap };
+   }
+ 
++  private assertNewtonStatusUsable(status: SolverStatus, context: string): void {
++    if (status.finite !== 1 || !Number.isFinite(status.energy) || !Number.isFinite(status.gradNorm)) {
++      throw new GpuExecutionFailure("validation-error",
++        `${context} solver status is invalid or stale; refusing Newton convergence`);
++    }
++  }
++
+   /** Per-step snapshot: positions + velocities to CPU (labeled, NOT hot-loop). */
+   private async snapshotDeviceState(): Promise<void> {
+     const ex = this.executor!;
+@@ -1356,7 +1442,12 @@ export class WebGpuSolver implements ClothSolver {
+     if (this.deviceMode === "device" && this.lastDeviceStatus) {
+       return {
+         ...this.lastDeviceStatus,
+-        deviceReady: true,
++        failed: this.lastDeviceFailure !== null,
++        failureReason: this.lastDeviceFailure?.reason ?? null,
++        requestedPath: "GPU",
++        actualPath: this.lastDevicePath.actual,
++        fallbackReason: this.lastDevicePath.fallbackReason,
++        deviceReady: this.lastDeviceFailure === null,
+         timestampQuery: this.executor?.facts.timestampQuery ?? false,
+         encodeMs: this.encodeMs, submitMs: this.submitMs, readbackMs: this.readbackMs,
+         statusBytes: 64,
+diff --git a/src/backend/webgpu/shaders/armijo.wgsl b/src/backend/webgpu/shaders/armijo.wgsl
+index 243ef25..ba83332 100644
+--- a/src/backend/webgpu/shaders/armijo.wgsl
++++ b/src/backend/webgpu/shaders/armijo.wgsl
+@@ -147,6 +147,11 @@ fn armijo_clear_counts(@builtin(global_invocation_id) gid : vec3u) {
+ @group(0) @binding(47) var<uniform> rDMin : f32;
+ @group(0) @binding(48) var<storage, read> rTrust : array<f32>; // trustScaleStore mirror
+ 
++fn is_finite_float(v : f32) -> bool {
++  // Keep compatible with older Dawn versions without an isFinite builtin.
++  return v == v && abs(v) <= 3.402823e38;
++}
++
+ @compute @workgroup_size(64)
+ fn armijo_record(@builtin(global_invocation_id) gid : vec3u) {
+   if (gid.x + gid.y * 4194240u != 0u) { return; }
+@@ -162,8 +167,8 @@ fn armijo_record(@builtin(global_invocation_id) gid : vec3u) {
+   let toi = rStatus[5];
+   let fin = rStatus[6] > 0.5;
+   let ccd = rStatus[7] > 0.5;
+-  let eOk = (e == e);
+-  let finiteOk = fin && eOk;
++  let eOk = is_finite_float(e);
++  let finiteOk = fin && eOk && is_finite_float(gnorm);
+   let ccdOk = ccd && !(toi > 0.0 && toi < 1.0 - 1e-9);
+   let barrierOk = dist > rDMin;
+   let overflow = rOverflow[0] != 0u;
+diff --git a/src/backend/webgpu/shaders/broadphase-sort.wgsl b/src/backend/webgpu/shaders/broadphase-sort.wgsl
+index 70101a2..32e5d06 100644
+--- a/src/backend/webgpu/shaders/broadphase-sort.wgsl
++++ b/src/backend/webgpu/shaders/broadphase-sort.wgsl
+@@ -90,11 +90,28 @@ fn sort_next(@builtin(global_invocation_id) gid : vec3u) {
+   sortCursor[0] = t + 1u;
+ }
+ 
++// sort_reset: zero the pass cursor (lane 0) ahead of a rebuild. Replaces the
++// CPU writeBuffer reset so the whole sort — and the whole broadphase — stays
++// in one encoder with no control-write flush. Lane 1 carries T (pass count,
++// written once at upload); steps clamp to it so a transient/duplicated step
++// degrades to re-running the last pass (idempotent) instead of an OOB read.
++@compute @workgroup_size(64)
++fn sort_reset(@builtin(global_invocation_id) gid : vec3u) {
++  if (gid.x + gid.y * 4194240u != 0u) { return; }
++  sortCursor[0] = 0u;
++}
++
+ @compute @workgroup_size(64)
+ fn sort_step_indexed(@builtin(global_invocation_id) gid : vec3u) {
+   let i = gid.x + gid.y * 4194240u;
+   // The matching sort_next already advanced the cursor past our pass.
+-  let t = sortCursor[0] - 1u;
++  // Clamp defensively: a step without its next (only possible via driver
++  // misuse, never in sortPassesIndexed lockstep) re-runs the final pass,
++  // which is idempotent, instead of reading out of bounds.
++  let raw = sortCursor[0] - 1u;
++  let hi = sortCursor[1];
++  var t = raw;
++  if (hi > 0u && raw >= hi) { t = hi - 1u; }
+   let prm = sortParams[t];
+   compareSwap(i, prm.x, prm.y, prm.z);
+ }
+diff --git a/src/backend/webgpu/shaders/diagnostics.wgsl b/src/backend/webgpu/shaders/diagnostics.wgsl
+index a7b4b2c..c9ce074 100644
+--- a/src/backend/webgpu/shaders/diagnostics.wgsl
++++ b/src/backend/webgpu/shaders/diagnostics.wgsl
+@@ -11,7 +11,7 @@
+ //       control writeBuffer after its own dot reduce — see gpu-executor.ts)
+ //   [4] minDistance over active contacts (1e30 sentinel when none)
+ //   [5] minTOI over contacts (2.0 NO_HIT sentinel when none)
+-//   [6] finite (0/1: any NaN lane poisons it; old Dawn has no isFinite)
++//   [6] finite (0/1: any NaN/Inf lane or aggregate poisons it)
+ //   [7] ccdSafe (contactFail == 0)
+ //   [8] barrierSafe (= finite)
+ //   [9] pcgBreakdown, [10] converged: CPU-written control fields
+@@ -53,7 +53,10 @@ var<workgroup> tF : array<f32, 64>; // finite flag (min: 0 if any NaN lane)
+ var<workgroup> tK : array<f32, 64>; // fail flag (max: 1 if any fail)
+ var<workgroup> tH : array<f32, 64>; // hinge energy sum
+ 
+-fn is_nan(x : f32) -> bool { return x != x; }
++fn is_finite_float(x : f32) -> bool {
++  // Old Dawn lacks isFinite; the bound rejects NaN and both infinities.
++  return x == x && abs(x) <= 3.402823e38;
++}
+ 
+ @compute @workgroup_size(64)
+ fn diag_stage1(
+@@ -67,23 +70,23 @@ fn diag_stage1(
+   var dm = 1e30; var tm = 2.0; var fin = 1.0; var fail = 0.0; var h = 0.0;
+   if (i < n3) {
+     let g = gradient[i];
+-    if (is_nan(g)) { fin = 0.0; } else { g2 = g * g; }
++    if (!is_finite_float(g)) { fin = 0.0; } else { g2 = g * g; }
+   }
+   if (i < params.triangleCount) {
+     let ee = elementEnergy[i];
+-    if (is_nan(ee)) { fin = 0.0; } else { e += ee; }
++    if (!is_finite_float(ee)) { fin = 0.0; } else { e += ee; }
+   }
+   if (i < params.hingeCount) {
+     let he = hingeEnergyOut[i];
+-    if (is_nan(he)) { fin = 0.0; } else { h += he; }
++    if (!is_finite_float(he)) { fin = 0.0; } else { h += he; }
+   }
+   if (i < params.contactCount) {
+     let ce = contactEnergy[i];
+-    if (is_nan(ce)) { fin = 0.0; } else { b += ce; }
++    if (!is_finite_float(ce)) { fin = 0.0; } else { b += ce; }
+     let dd = contactDist[i];
+-    if (is_nan(dd)) { fin = 0.0; } else if (dd < dm) { dm = dd; }
++    if (!is_finite_float(dd)) { fin = 0.0; } else if (dd < dm) { dm = dd; }
+     let tt = contactTOI[i];
+-    if (is_nan(tt)) { fin = 0.0; } else if (tt < tm) { tm = tt; }
++    if (!is_finite_float(tt)) { fin = 0.0; } else if (tt < tm) { tm = tt; }
+   }
+   // inertia 0.5*m*(x-yHat)^2/h^2 needs per-VERTEX indexing: thread i covers
+   // component i%3 of vertex i/3 — accumulate per-component then sum.
+@@ -96,7 +99,7 @@ fn diag_stage1(
+     else if (k == 1u) { pv = position[v].y; rv = positionRef[v].y; }
+     else { pv = position[v].z; rv = positionRef[v].z; }
+     let dd2 = pv - rv;
+-    if (is_nan(dd2) || is_nan(mass[v])) { fin = 0.0; }
++    if (!is_finite_float(dd2) || !is_finite_float(mass[v])) { fin = 0.0; }
+     else { e += 0.5 * mass[v] * dd2 * dd2 * params.invDt2; }
+   }
+   if (contactFail[0] != 0u) { fail = 1.0; }
+@@ -161,15 +164,19 @@ fn diag_stage2(@builtin(local_invocation_id) lid : vec3u) {
+     workgroupBarrier();
+   }
+   if (lid.x == 0u) {
+-    statusOut[0] = tE[0] + tH[0];
++    let totalEnergy = tE[0] + tH[0];
++    let gradNorm = sqrt(tG[0]);
++    if (!is_finite_float(totalEnergy) || !is_finite_float(tB[0]) ||
++        !is_finite_float(gradNorm)) { fin = 0.0; }
++    statusOut[0] = totalEnergy;
+     statusOut[1] = tB[0];
+-    statusOut[2] = sqrt(tG[0]);
++    statusOut[2] = gradNorm;
+     statusOut[3] = 0.0; // dirDotGradient: CPU-written control field
+     statusOut[4] = tD[0];
+     statusOut[5] = tT[0];
+-    statusOut[6] = tF[0];
++    statusOut[6] = min(tF[0], fin);
+     statusOut[7] = 1.0 - tK[0]; // ccdSafe
+-    statusOut[8] = tF[0]; // barrierSafe
++    statusOut[8] = min(tF[0], fin); // barrierSafe
+     statusOut[9] = 0.0; // pcgBreakdown: CPU-written
+     statusOut[10] = 0.0; // converged: CPU-written
+     statusOut[11] = 0.0;
+diff --git a/src/backend/webgpu/shaders/newton-control.wgsl b/src/backend/webgpu/shaders/newton-control.wgsl
+index 4fe633a..cc713f1 100644
+--- a/src/backend/webgpu/shaders/newton-control.wgsl
++++ b/src/backend/webgpu/shaders/newton-control.wgsl
+@@ -67,7 +67,8 @@ fn descent_check(@builtin(global_invocation_id) gid : vec3u) {
+   if (gid.x + gid.y * 4194240u != 0u) { return; }
+   let gtdx = dcGtdx[0];
+   var fb = 0.0;
+-  if (!(gtdx == gtdx) || gtdx >= 0.0 || dcBreak[0] != 0.0) { fb = 1.0; }
++  // Old Dawn lacks isFinite; this catches NaN and both infinities.
++  if (!(abs(gtdx) <= 3.402823e38) || gtdx >= 0.0 || dcBreak[0] != 0.0) { fb = 1.0; }
+   dcCtl[1] = fb;
+   if (fb > 0.5) { dcStatus[3] = 0.0; } else { dcStatus[3] = 1.0; }
+ }
+@@ -94,7 +95,7 @@ fn select_fallback(@builtin(global_invocation_id) gid : vec3u) {
+ // the armijoStatus lanes the select kernel fills); over-binding a pruned
+ // binding fails Dawn validation and poisons the whole encoder — see G6C notes.
+ @group(0) @binding(52) var<storage, read_write> caCtl : array<f32>; // newtonCtl
+-@group(0) @binding(53) var<storage, read_write> caE0 : array<f32>; // e0Store
++@group(0) @binding(53) var<storage, read> caE0 : array<f32>; // round-start energy
+ @group(0) @binding(54) var<storage, read_write> caStatus : array<f32>; // newtonStatus
+ @group(0) @binding(55) var<uniform> caK : u32; // ArmijoK (this batch width)
+ 
+@@ -103,6 +104,9 @@ fn commit_arm(@builtin(global_invocation_id) gid : vec3u) {
+   if (gid.x + gid.y * 4194240u != 0u) { return; }
+   let b = caCtl[5]; // nbBatch counter (f32 holding u32, exact for small ints)
+   let bi = u32(b + 0.5);
++  // Cumulative trial base entering this batch (correct under varying batch
++  // widths, unlike bi*K — the hook adaptive-K will pull).
++  let base = u32(caCtl[7] + 0.5);
+   let localAccept = caBatch[0] > 0.5;
+   // sticky failure-flag ORs (per-batch counters would otherwise be lost)
+   if (caBatch[7] > 0.0) { caStatus[15] = 1.0; }
+@@ -117,16 +121,18 @@ fn commit_arm(@builtin(global_invocation_id) gid : vec3u) {
+     caCtl[4] = caBatch[1]; // nbAlpha (effective)
+     caCtl[6] = f32(bi); // nbAcceptBatch
+     let li = u32(caBatch[2] + 0.5); // local selected index
+-    caCtl[8] = f32(bi * caK + li); // global trial index
+-    // merit BEFORE overwriting e0 (round-start energy minus accepted)
++    caCtl[8] = f32(base + li); // global trial index (cumulative base)
++    // Merit is measured against the unchanged round-start energy.
+     caStatus[11] = caE0[0] - caBatch[9];
+-    caE0[0] = caBatch[9]; // latch accepted energy for later rounds
++    // Lane 12 latches accepted energy; e0Store stays at round-start energy
++    // until all speculative batches have used it.
++    caStatus[9] = caBatch[10];
+     caStatus[12] = caBatch[9];
+     caStatus[13] = caBatch[13];
+     caStatus[14] = caBatch[14];
+   }
+   caCtl[5] = f32(bi + 1u);
+-  caCtl[7] = caCtl[7] + f32(caK); // nbTrialBase advance (exact for small ints)
++  caCtl[7] = f32(base + caK); // advance by THIS batch's width
+ }
+ 
+ // ---- commit_apply re-materializes xTrial at the LATCHED accepted alpha.
+@@ -164,7 +170,9 @@ fn commit_apply(@builtin(global_invocation_id) gid : vec3u) {
+ fn commit_copy_if(@builtin(global_invocation_id) gid : vec3u) {
+   let v = gid.x + gid.y * 4194240u;
+   if (v >= ccParams.vertexCount) { return; }
+-  if (ccCtl[3] < 0.5) { return; }
++  // nbAccepted (lane 2, sticky across batches), NOT per-batch doCommit:
++  // the single end-of-round commit fires iff ANY batch accepted.
++  if (ccCtl[2] < 0.5) { return; }
+   ccPos[v] = ccTrial[v];
+ }
+ 
+@@ -179,7 +187,8 @@ fn commit_copy_if(@builtin(global_invocation_id) gid : vec3u) {
+ fn commit_lagged_if(@builtin(global_invocation_id) gid : vec3u) {
+   let i = gid.x + gid.y * 4194240u;
+   if (i >= clParams.contactCount) { return; }
+-  if (clCtl[3] < 0.5) { return; }
++  // See commit_copy_if: sticky nbAccepted, not per-batch doCommit.
++  if (clCtl[2] < 0.5) { return; }
+   // Same body as contact-force commit_lagged (d>=dHat keeps stale entry).
+   let d = max(clDist[i], 1e-12);
+   let prm = clPrm[i];
+@@ -211,18 +220,19 @@ fn newton_check(@builtin(global_invocation_id) gid : vec3u) {
+   if (gnorm < ncTol) { conv = 1.0; }
+   ncRound[1] = conv;
+   ncRound[9] = gnorm;
++  ncRound[13] = ncStatus[4];
++  ncRound[14] = ncStatus[5];
+   if (conv > 0.5) { ncCtl[0] = 1.0; }
+ }
+ 
+ // ---- round_report: assemble the compact round status (single read/round).
+ // Lanes from: newtonCtl (done/fallback/accepted/alpha/batch/trial),
+ // pcg_report (breakdown/residual), trust_compute (stepNorm), commit-arm
+-// latched energy/minDist/minToi/merit, batch status (accepted flag source).
++// latched accepted energy/minDist/minToi/merit and current-state diagnostics.
+ @group(0) @binding(90) var<storage, read> rrCtl : array<f32>; // newtonCtl
+ @group(0) @binding(91) var<storage, read_write> rrRound : array<f32>; // newtonStatus
+ @group(0) @binding(92) var<storage, read> rrGtdx : array<f32>; // gtdxStore (for the report lane)
+-@group(0) @binding(93) var<storage, read> rrE0 : array<f32>; // e0Store (accepted-or-round-start energy)
+-@group(0) @binding(94) var<storage, read> rrBatch : array<f32>; // armijoStatus (last batch lanes)
++@group(0) @binding(93) var<storage, read_write> rrE0 : array<f32>; // e0Store (round-start until report)
+ 
+ @compute @workgroup_size(64)
+ fn round_report(@builtin(global_invocation_id) gid : vec3u) {
+@@ -235,16 +245,18 @@ fn round_report(@builtin(global_invocation_id) gid : vec3u) {
+   rrRound[7] = rrCtl[4]; // selectedAlpha (effective)
+   rrRound[8] = rrCtl[8]; // selected global trial index
+   if (rrCtl[2] < 0.5) {
+-    rrRound[2] = 1.0; // no commit this round = failed Newton iterate
++    if (rrCtl[0] < 0.5) { rrRound[2] = 1.0; } // no commit and not converged
+     rrRound[5] = 0.0;
+     rrRound[7] = 0.0;
+     rrRound[8] = 4294967295.0;
+   }
+   if (rrCtl[1] > 0.5) { rrRound[3] = 0.0; }
+   rrRound[19] = rrGtdx[0];
+-  // Energy + distance lanes: e0Store holds the accepted (or round-start)
+-  // energy; the last batch status carries the freshest minDist/minToi.
+-  rrRound[12] = rrE0[0];
+-  rrRound[13] = rrBatch[13];
+-  rrRound[14] = rrBatch[14];
++  // Keep the round-start E0 stable through every speculative batch. Latch the
++  // accepted energy only now, for the next Newton round.
++  if (rrCtl[2] > 0.5) {
++    rrE0[0] = rrRound[12];
++  } else {
++    rrRound[12] = rrE0[0];
++  }
+ }
+diff --git a/tests/webgpu/device-solver.test.ts b/tests/webgpu/device-solver.test.ts
+index 68d79ec..899e0ab 100644
+--- a/tests/webgpu/device-solver.test.ts
++++ b/tests/webgpu/device-solver.test.ts
+@@ -373,6 +373,9 @@ describe("G3 device solver parity", () => {
+     if (!strip) return;
+     const { solver } = strip;
+     const d = await solver.stepGpu(1 / 60, { newtonIters: 1 });
++    expect(d.failed).toBe(false);
++    expect(d.requestedPath).toBe("GPU");
++    expect(d.actualPath).toBe("GPU");
+     expect(d.finite).toBe(1);
+     expect(Number.isFinite(d.energy)).toBe(true);
+     expect(Number.isFinite(d.gradNorm)).toBe(true);
+diff --git a/tests/webgpu/g6b-armijo-ladder.test.ts b/tests/webgpu/g6b-armijo-ladder.test.ts
+index 901509e..4048956 100644
+--- a/tests/webgpu/g6b-armijo-ladder.test.ts
++++ b/tests/webgpu/g6b-armijo-ladder.test.ts
+@@ -281,6 +281,77 @@ describe("G6B batch ladder + gates", () => {
+     }
+   }, 300000);
+ 
++  it("diagnostics marks an infinite RHS lane non-finite", async () => {
++    if (!strip) return;
++    const { solver, ex, driver } = strip;
++    const scene = (solver as unknown as { scene: ClothScene }).scene;
++    const start = Float64Array.from(scene.positions);
++    resetDeviceState(strip, start);
++    solver.configureStep(1 / 60);
++    let rhsOriginal: ArrayBuffer | null = null;
++    try {
++      await solver.evaluateNewtonState(false, 1, 1 / 60);
++      rhsOriginal = await ex.readBufferDebug("rhs", "rhs-finite-baseline", false);
++      const poisoned = new Float32Array(rhsOriginal);
++      poisoned[0] = Infinity;
++      ex.writeBuffer("rhs", poisoned);
++      const result = await driver.diagnosticsAt("position");
++      expect(result.status.finite).toBe(0);
++      expect(Number.isFinite(result.status.gradNorm)).toBe(true);
++    } finally {
++      // Re-establish a coherent state for later tests sharing this fixture.
++      if (rhsOriginal) ex.writeBuffer("rhs", new Float32Array(rhsOriginal));
++      resetDeviceState(strip, start);
++    }
++  }, 300000);
++
++  it("Armijo rejects an infinite energy even when the incoming finite bit is stale", async () => {
++    if (!strip) return;
++    const { ex, driver } = strip;
++    const status = new Float32Array(16);
++    status[0] = -Infinity;
++    status[2] = 1;
++    status[4] = 1;
++    status[5] = 2;
++    status[6] = 1; // Simulate a stale or incorrectly permissive status bit.
++    status[7] = 1;
++    ex.writeBuffer("solverStatus", status);
++    ex.writeBuffer("contactOverflow", new Uint32Array(4));
++    ex.writeBuffer("armijoCandidates", new Float32Array(64));
++    const batch = new Float32Array(16);
++    batch[8] = 1;
++    ex.writeBuffer("armijoStatus", batch);
++    ex.writeBuffer("armijoAlphas", new Float32Array(8).fill(1));
++    ex.writeBuffer("armijoCur", new Uint32Array(4));
++    ex.writeBuffer("e0Store", new Float32Array([1, 0, 0, 0]));
++    ex.writeBuffer("gtdxStore", new Float32Array([-1, 0, 0, 0]));
++    ex.writeBuffer("trustScaleStore", new Float32Array([1, 0, 0, 0]));
++    driver.bankF(GpuUniformSlot.DMin, 0);
++    ex.beginBatch("armijo-negative-infinity");
++    ex.runPass({
++      shader: "armijo", entry: "armijo_record",
++      groups: [[
++        { binding: 8, buffer: "armijoAlphas" },
++        { binding: 9, buffer: "armijoCur" },
++        { binding: 40, buffer: "solverStatus" },
++        { binding: 41, buffer: "contactOverflow" },
++        { binding: 42, buffer: "armijoCandidates" },
++        { binding: 43, buffer: "armijoStatus" },
++        { binding: 45, buffer: "e0Store" },
++        { binding: 46, buffer: "gtdxStore" },
++        { binding: 47, buffer: "uniformBank", offset: GpuUniformSlot.DMin * 256, size: 4 },
++        { binding: 48, buffer: "trustScaleStore" },
++      ]],
++      x: 1,
++    });
++    await ex.submitBatch(false);
++    const candidates = new Float32Array(await ex.readBufferDebug("armijoCandidates", "armijo-inf-row", false));
++    const recorded = new Float32Array(await ex.readBufferDebug("armijoStatus", "armijo-inf-status", false));
++    expect(candidates[3]).toBe(0);
++    expect(candidates[6]).toBe(0);
++    expect(recorded[8]).toBe(0);
++  }, 300000);
++
+   it("friction commits on accept, never on reject", async () => {
+     const fix = await requireDevice(foldScene, { contactCapacity: 2048, pairCapacity: 8192 });
+     if (!fix) return;
+diff --git a/tests/webgpu/g6c-newton-e2e.test.ts b/tests/webgpu/g6c-newton-e2e.test.ts
+index 93c8a1e..ada2218 100644
+--- a/tests/webgpu/g6c-newton-e2e.test.ts
++++ b/tests/webgpu/g6c-newton-e2e.test.ts
+@@ -204,7 +204,7 @@ describe("G6C.2 GPU Newton end-to-end", () => {
+     }> = [
+       { name: "strip", build: stripScene, tight: true, contacts: false },
+       { name: "floor", build: floorScene, tight: true, contacts: false },
+-      { name: "plate", build: plateScene, tight: false, contacts: true },
++      { name: "plate", build: plateScene, tight: false, contacts: false }, // measured 0 after one step on both paths (5 cm gap, ~1.4 mm fall)
+       { name: "fold", build: foldScene, tight: false, contacts: true },
+       { name: "friction", build: frictionScene, tight: false, contacts: true },
+       { name: "5x", build: () => stiffScene(5), tight: true, contacts: false },
+@@ -222,10 +222,21 @@ describe("G6C.2 GPU Newton end-to-end", () => {
+         const scene = (solver as unknown as { scene: ClothScene }).scene;
+         const x0 = Float64Array.from(scene.positions);
+         const n = scene.mesh.count;
++        // Scene velocities (frictionScene closes at ±0.25 m/s; every other
++        // scene starts at rest, so this is a no-op for them). Zeroing here
++        // instead would freeze the friction patches 4 mm apart and the
++        // contacts:true check below would measure the harness, not the path.
++        const v0 = Float64Array.from(scene.velocities);
+         const seqPos: Float64Array[] = [];
+         for (const gpu of [false, true]) {
+           resetDeviceState(fix, Float64Array.from(x0));
+-          fix.ex.writeBuffer("velocity", new Float32Array(n * 4));
++          const vPack = new Float32Array(n * 4);
++          for (let i = 0; i < n; i++) {
++            vPack[i * 4] = Math.fround(v0[i * 3]);
++            vPack[i * 4 + 1] = Math.fround(v0[i * 3 + 1]);
++            vPack[i * 4 + 2] = Math.fround(v0[i * 3 + 2]);
++          }
++          fix.ex.writeBuffer("velocity", vPack);
+           driver.cfg.useGpuNewtonControl = gpu;
+           const d = await solver.stepGpu(1 / 60, { newtonIters: 2 });
+           expect(Number.isFinite(d.energy)).toBe(true);
+diff --git a/tests/webgpu/g6c-newton-parity.test.ts b/tests/webgpu/g6c-newton-parity.test.ts
+index 3bf0bf0..ca8f4fa 100644
+--- a/tests/webgpu/g6c-newton-parity.test.ts
++++ b/tests/webgpu/g6c-newton-parity.test.ts
+@@ -3,7 +3,7 @@
+ // Compares accepted alpha/index, committed positions, energy, convergence,
+ // fallback selection, and direction validity. Plus control-kernel unit tests
+ // (descent_check/select_fallback/newton_check/commit arbitration).
+-import { describe, it, expect, beforeAll } from "vitest";
++import { describe, it, expect, beforeAll, vi } from "vitest";
+ import type { ClothScene } from "../../src/physics/scene.js";
+ import type { SolverStatus } from "../../src/backend/webgpu/gpu-buffers.js";
+ import { GpuUniformSlot } from "../../src/backend/webgpu/gpu-buffers.js";
+@@ -218,5 +218,87 @@ describe("G6C.2 Gate A full-iteration parity", () => {
+     expect(ctl2[1]).toBe(0.0);
+     const sd2 = new Float32Array(await ex.readBufferDebug("searchDirection", "descent-sd2", false));
+     for (let i = 0; i < n3; i++) expect(sd2[i]).toBe(1.0);
++    // Negative infinity is non-finite even though it is numerically < 0;
++    // it must not pass the descent gate.
++    ex.writeBuffer("gtdxStore", new Float32Array([-Infinity, 0, 0, 0]));
++    ex.writeBuffer("breakFlag", new Float32Array(4));
++    ex.writeBuffer("newtonCtl", new Float32Array(16));
++    ex.writeBuffer("newtonStatus", new Float32Array(20));
++    ex.writeBuffer("descentDir", new Float32Array(n3).fill(7.0));
++    ex.writeBuffer("searchDirection", new Float32Array(n3).fill(1.0));
++    await runDescent();
++    const ctl3 = new Float32Array(await ex.readBufferDebug("newtonCtl", "descent-ctl3", false));
++    expect(ctl3[1]).toBe(1.0);
++  }, 300000);
++
++  it("uses fallback direction for Armijo slope and trust scaling after PCG breakdown", async () => {
++    if (!strip) return;
++    const { solver, ex, driver } = strip;
++    const scene = (solver as unknown as { scene: ClothScene }).scene;
++    const start = Float64Array.from(scene.positions);
++    resetDeviceState(strip, start);
++    solver.configureStep(1 / 60);
++    const ev = await solver.evaluateNewtonState(false, 1, 1 / 60);
++    solver.beginArmijoBatch(0);
++    driver.bankF(GpuUniformSlot.NewtonTol, 0);
++    const trust = 1e-8;
++    driver.bankF(GpuUniformSlot.NewtonTrust, trust);
++    ex.writeBuffer("e0Store", new Float32Array([ev.status.energy, 0, 0, 0]));
++    ex.writeBuffer("newtonCtl", new Float32Array(16));
++    ex.writeBuffer("newtonStatus", new Float32Array(20));
++
++    const forcedPcg = vi.spyOn(driver, "pcgSolve").mockImplementation(async () => {
++      // Force a zero PCG vector plus a latched breakdown. The GPU fallback
++      // then replaces it with -rhs/diag; its slope and max norm must be used.
++      ex.writeBuffer("searchDirection", new Float32Array(driver.n3));
++      ex.writeBuffer("breakFlag", new Float32Array([1, 0, 0, 0]));
++      ex.writeBuffer("reduceScratch", new Float32Array(4));
++      ex.runPass({
++        shader: "newton-control", entry: "pcg_report",
++        groups: [[
++          { binding: 10, buffer: "reduceScratch" },
++          { binding: 11, buffer: "breakFlag" },
++          { binding: 12, buffer: "newtonStatus" },
++        ]],
++        x: 1,
++      });
++      return { resNorm: 0, breakdown: true };
++    });
++
++    try {
++      const mt = scene.material;
++      const beta = Math.max(mt.stretchWarp, mt.stretchWeft, mt.shear) * mt.thickness * 0.1 + 1e-6;
++      const st = await driver.newtonRound({
++        round: 0, beta,
++        mat: {
++          c00: mt.stretchWarp, c11: mt.stretchWeft,
++          c01: mt.stretchCoupling, g: mt.shear, thickness: mt.thickness,
++        },
++        contact: {
++          dHat: 0.002, kappa: 50, mu: 0.3, fricEps: 1e-4,
++          floorY: 1e30, floorOn: 0, dMin: 1e-4, contactCapacity: driver.c.cap,
++        },
++        batchKs: [1], evalIndexBase: 0,
++      });
++      const rhs = new Float32Array(await ex.readBufferDebug("rhs", "fallback-rhs", false));
++      const dx = new Float32Array(await ex.readBufferDebug("searchDirection", "fallback-dx", false));
++      const scale = new Float32Array(await ex.readBufferDebug("trustScaleStore", "fallback-trust", false))[0];
++      let expectedDot = 0;
++      let maxDx = 0;
++      for (let i = 0; i < dx.length; i++) {
++        expectedDot += rhs[i] * dx[i];
++        maxDx = Math.max(maxDx, Math.abs(dx[i]));
++      }
++      const expectedScale = maxDx > trust ? trust / maxDx : 1;
++      expect(st.pcgBreakdown).toBe(true);
++      expect(st.directionValid).toBe(false);
++      expect(Math.abs(expectedDot)).toBeGreaterThan(1e-12);
++      expect(st.gtdx).toBeCloseTo(expectedDot, 4);
++      expect(scale).toBeCloseTo(expectedScale, 6);
++      expect(scale).toBeLessThan(1);
++    } finally {
++      forcedPcg.mockRestore();
++      resetDeviceState(strip, start);
++    }
+   }, 300000);
+ });

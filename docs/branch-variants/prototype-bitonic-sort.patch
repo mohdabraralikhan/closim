@@ -1,0 +1,232 @@
+﻿diff --git a/src/backend/webgpu/gpu-broadphase.ts b/src/backend/webgpu/gpu-broadphase.ts
+index 5dbb560..682e48d 100644
+--- a/src/backend/webgpu/gpu-broadphase.ts
++++ b/src/backend/webgpu/gpu-broadphase.ts
+@@ -31,6 +31,8 @@ import {
+   candidatePairKey,
+ } from "../../collision/broadphase.js";
+ import { buildAdjacencyExclusions } from "../../collision/bvh.js";
++import type { GpuExecutor } from "./gpu-executor.js";
++import { GpuUniformSlot, UNIFORM_SLOT_STRIDE } from "./gpu-buffers.js";
+ 
+ const f = (v: number): number => Math.fround(v);
+ 
+@@ -383,3 +385,140 @@ export class GpuBroadPhase implements BroadPhase {
+     };
+   }
+ }
++
++export type BitonicSortMode = "legacy" | "static-slots" | "wgsl-derived";
++
++export interface BitonicSortOptions {
++  P: number;
++  mode: BitonicSortMode;
++  keysBuffer?: string;
++  payloadBuffer?: string;
++  paramsBuffer?: string;
++  cursorBuffer?: string;
++  uniformSlotN?: number;
++  uniformSlotStage?: number;
++  uniformSlotSub?: number;
++  explicitDispatch?: { x: number; y: number };
++}
++
++/** Pre-computes the static parameter table for Approach B (T passes of vec4u (P, stage, sub, 0)). */
++export function buildBitonicParamsTable(P: number): Uint32Array {
++  const stages = Math.log2(P);
++  const T = bitonicPassCount(stages);
++  const table = new Uint32Array(T * 4);
++  for (let t = 0; t < T; t++) {
++    const { stage, sub } = bitonicPassAt(t);
++    table[t * 4] = P >>> 0;
++    table[t * 4 + 1] = stage >>> 0;
++    table[t * 4 + 2] = sub >>> 0;
++    table[t * 4 + 3] = 0;
++  }
++  return table;
++}
++
++/**
++ * Encode GPU bitonic sort passes into an open executor batch.
++ *
++ * Modes:
++ * - "legacy": Uniform rewriting per sub-pass (causes intermediate queue flushes).
++ * - "static-slots" (Approach B): Static pre-computed table + GPU cursor. Uses
++ *   sort_reset GPU pass to avoid CPU writeBuffer flush -> runs in 1 single submit!
++ * - "wgsl-derived" (Approach A): Stage/sub derived on GPU inside WGSL from cursor.
++ *   Eliminates sortParams buffer allocation and upload entirely -> 1 single submit!
++ */
++export function encodeBitonicSort(ex: GpuExecutor, opts: BitonicSortOptions): void {
++  const P = opts.P;
++  const stages = Math.log2(P);
++  const T = bitonicPassCount(stages);
++  const keysBuf = opts.keysBuffer ?? "mortonKeys";
++  const payBuf = opts.payloadBuffer ?? "mortonPayload";
++  const paramsBuf = opts.paramsBuffer ?? "sortParams";
++  const cursorBuf = opts.cursorBuffer ?? "sortCursor";
++  const slotN = opts.uniformSlotN ?? GpuUniformSlot.SortN;
++  const slotStage = opts.uniformSlotStage ?? GpuUniformSlot.SortStage;
++  const slotSub = opts.uniformSlotSub ?? GpuUniformSlot.SortSub;
++
++  const totalGroups = Math.max(1, Math.ceil(P / 64));
++  let dx = totalGroups;
++  let dy = 1;
++  if (opts.explicitDispatch) {
++    dx = opts.explicitDispatch.x;
++    dy = opts.explicitDispatch.y;
++  } else if (totalGroups > 65535) {
++    dx = 65535;
++    dy = Math.ceil(totalGroups / 65535);
++  }
++
++  if (opts.mode === "legacy") {
++    for (let k = 1; k <= stages; k++) {
++      for (let j = k - 1; j >= 0; j--) {
++        ex.writeBankU32(slotN, P);
++        ex.writeBankU32(slotStage, k);
++        ex.writeBankU32(slotSub, j);
++        ex.runPass({
++          shader: "broadphase-sort", entry: "bitonic_sort_step",
++          groups: [[
++            { binding: 0, buffer: keysBuf },
++            { binding: 1, buffer: payBuf },
++            { binding: 2, buffer: ex.uniformBankName, offset: slotN * UNIFORM_SLOT_STRIDE, size: 4 },
++            { binding: 3, buffer: ex.uniformBankName, offset: slotStage * UNIFORM_SLOT_STRIDE, size: 4 },
++            { binding: 4, buffer: ex.uniformBankName, offset: slotSub * UNIFORM_SLOT_STRIDE, size: 4 },
++          ]],
++          x: dx, y: dy,
++        });
++      }
++    }
++  } else if (opts.mode === "static-slots") {
++    // Approach B: static table + GPU cursor.
++    // Reset cursor via GPU pass - ZERO CPU writes, ZERO flushes!
++    ex.runPass({
++      shader: "broadphase-sort", entry: "sort_reset",
++      groups: [[{ binding: 6, buffer: cursorBuf }]],
++      x: 1,
++    });
++    for (let t = 0; t < T; t++) {
++      ex.runPass({
++        shader: "broadphase-sort", entry: "sort_next",
++        groups: [[{ binding: 6, buffer: cursorBuf }]],
++        x: 1,
++      });
++      ex.runPass({
++        shader: "broadphase-sort", entry: "sort_step_indexed",
++        groups: [[
++          { binding: 0, buffer: keysBuf },
++          { binding: 1, buffer: payBuf },
++          { binding: 5, buffer: paramsBuf },
++          { binding: 6, buffer: cursorBuf },
++        ]],
++        x: dx, y: dy,
++      });
++    }
++  } else if (opts.mode === "wgsl-derived") {
++    // Approach A: WGSL derivation of (k, j) from cursor index t.
++    // Reset cursor via GPU pass - ZERO CPU writes, ZERO flushes!
++    ex.runPass({
++      shader: "broadphase-sort", entry: "sort_reset",
++      groups: [[{ binding: 6, buffer: cursorBuf }]],
++      x: 1,
++    });
++    // Note: n is constant and should be written once before opening the batch (or at scene init).
++    for (let t = 0; t < T; t++) {
++      ex.runPass({
++        shader: "broadphase-sort", entry: "sort_next",
++        groups: [[{ binding: 6, buffer: cursorBuf }]],
++        x: 1,
++      });
++      ex.runPass({
++        shader: "broadphase-sort", entry: "sort_step_derived",
++        groups: [[
++          { binding: 0, buffer: keysBuf },
++          { binding: 1, buffer: payBuf },
++          { binding: 2, buffer: ex.uniformBankName, offset: slotN * UNIFORM_SLOT_STRIDE, size: 4 },
++          { binding: 6, buffer: cursorBuf },
++        ]],
++        x: dx, y: dy,
++      });
++    }
++  }
++}
++
+diff --git a/src/backend/webgpu/gpu-executor.ts b/src/backend/webgpu/gpu-executor.ts
+index 11c4d55..146bf2a 100644
+--- a/src/backend/webgpu/gpu-executor.ts
++++ b/src/backend/webgpu/gpu-executor.ts
+@@ -200,6 +200,7 @@ export class GpuExecutor {
+     const have = this.buffers.get(name);
+     if (have && (this.bufferBytes.get(name) ?? 0) >= bytes) return have;
+     if (have) {
++      this.bindGroups.clear();
+       try { have.destroy(); } catch { /* best effort */ }
+     }
+     const buf = this.device.createBuffer({
+@@ -397,13 +398,11 @@ export class GpuExecutor {
+     // workgroups (4,194,240 threads at workgroup 64). Counts past that
+     // (contact expand at 50k dispatches 188160 groups) split across Y rows;
+     // shaders compute the flat index as gid.x + gid.y * 4194240.
+-    // Reductions and sorts (pcg-reduce, diagnostics, broadphase-sort) are
+-    // NOT row-splittable — their counts are vertex/element/contact scale
+-    // and stay far below the cap; exceeding it is a loud error, never
+-    // silent truncation. No caller passes y today (all dispatches are 1D).
++    // Reductions (pcg-reduce, diagnostics) are NOT row-splittable;
++    // broadphase-sort computes flat index gid.x + gid.y * 4194240 and is row-splittable.
+     const MAX_GROUPS_X = 65535;
+     const NO_SPLIT: ReadonlySet<string> = new Set(
+-      ["pcg-reduce", "diagnostics", "broadphase-sort"],
++      ["pcg-reduce", "diagnostics"],
+     );
+     let dx = spec.x;
+     let dy = spec.y ?? 1;
+diff --git a/src/backend/webgpu/gpu-pipelines.ts b/src/backend/webgpu/gpu-pipelines.ts
+index a264b67..4f041ed 100644
+--- a/src/backend/webgpu/gpu-pipelines.ts
++++ b/src/backend/webgpu/gpu-pipelines.ts
+@@ -79,7 +79,7 @@ export const SHADER_ENTRY_POINTS: Record<ShaderName, string[]> = {
+   "barrier-hvp": ["barrier_hvp_project", "assemble_barrier_hvp", "contact_diag"],
+   "broadphase-aabb": ["main"],
+   "broadphase-morton": ["main"],
+-  "broadphase-sort": ["bitonic_sort_step", "sort_next", "sort_step_indexed"],
++  "broadphase-sort": ["bitonic_sort_step", "sort_next", "sort_step_indexed", "sort_reset", "sort_step_derived"],
+   "broadphase-lbvh": ["lbvh_seed_leaves", "lbvh_build", "lbvh_find_root", "lbvh_refit"],
+   "broadphase-traverse": ["traverse"],
+   "closest-vt": ["closest_vt"],
+diff --git a/src/backend/webgpu/shaders/broadphase-sort.wgsl b/src/backend/webgpu/shaders/broadphase-sort.wgsl
+index 70101a2..af5a24a 100644
+--- a/src/backend/webgpu/shaders/broadphase-sort.wgsl
++++ b/src/backend/webgpu/shaders/broadphase-sort.wgsl
+@@ -98,3 +98,31 @@ fn sort_step_indexed(@builtin(global_invocation_id) gid : vec3u) {
+   let prm = sortParams[t];
+   compareSwap(i, prm.x, prm.y, prm.z);
+ }
++
++// Reset sortCursor to 0 via a GPU compute pass, eliminating the CPU writeBuffer flush.
++@compute @workgroup_size(64)
++fn sort_reset(@builtin(global_invocation_id) gid : vec3u) {
++  if (gid.x + gid.y * 4194240u != 0u) { return; }
++  sortCursor[0] = 0u;
++}
++
++// Approach A: derive (stage k, substage j) directly inside WGSL from linear pass index t.
++// k = floor((sqrt(8t + 1) + 1) / 2)
++// offset = t - k*(k - 1)/2
++// sub = (k - 1) - offset
++// Eliminates sortParams storage buffer table upload entirely.
++fn bitonic_params_derive(t : u32) -> vec2u {
++  let k = u32(floor((sqrt(f32(8u * t + 1u)) + 1.0) * 0.5));
++  let offset = t - (k * (k - 1u)) / 2u;
++  let sub = (k - 1u) - offset;
++  return vec2u(k, sub);
++}
++
++@compute @workgroup_size(64)
++fn sort_step_derived(@builtin(global_invocation_id) gid : vec3u) {
++  let i = gid.x + gid.y * 4194240u;
++  let t = sortCursor[0] - 1u;
++  let ks = bitonic_params_derive(t);
++  compareSwap(i, n, ks.x, ks.y);
++}
++

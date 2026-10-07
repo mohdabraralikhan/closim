@@ -204,7 +204,7 @@ describe("G6C.2 GPU Newton end-to-end", () => {
     }> = [
       { name: "strip", build: stripScene, tight: true, contacts: false },
       { name: "floor", build: floorScene, tight: true, contacts: false },
-      { name: "plate", build: plateScene, tight: false, contacts: true },
+      { name: "plate", build: plateScene, tight: false, contacts: false }, // measured 0 after one step on both paths (5 cm gap, ~1.4 mm fall)
       { name: "fold", build: foldScene, tight: false, contacts: true },
       { name: "friction", build: frictionScene, tight: false, contacts: true },
       { name: "5x", build: () => stiffScene(5), tight: true, contacts: false },
@@ -222,10 +222,21 @@ describe("G6C.2 GPU Newton end-to-end", () => {
         const scene = (solver as unknown as { scene: ClothScene }).scene;
         const x0 = Float64Array.from(scene.positions);
         const n = scene.mesh.count;
+        // Scene velocities (frictionScene closes at ±0.25 m/s; every other
+        // scene starts at rest, so this is a no-op for them). Zeroing here
+        // instead would freeze the friction patches 4 mm apart and the
+        // contacts:true check below would measure the harness, not the path.
+        const v0 = Float64Array.from(scene.velocities);
         const seqPos: Float64Array[] = [];
         for (const gpu of [false, true]) {
           resetDeviceState(fix, Float64Array.from(x0));
-          fix.ex.writeBuffer("velocity", new Float32Array(n * 4));
+          const vPack = new Float32Array(n * 4);
+          for (let i = 0; i < n; i++) {
+            vPack[i * 4] = Math.fround(v0[i * 3]);
+            vPack[i * 4 + 1] = Math.fround(v0[i * 3 + 1]);
+            vPack[i * 4 + 2] = Math.fround(v0[i * 3 + 2]);
+          }
+          fix.ex.writeBuffer("velocity", vPack);
           driver.cfg.useGpuNewtonControl = gpu;
           const d = await solver.stepGpu(1 / 60, { newtonIters: 2 });
           expect(Number.isFinite(d.energy)).toBe(true);

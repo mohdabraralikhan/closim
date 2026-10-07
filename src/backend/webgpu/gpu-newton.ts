@@ -139,6 +139,16 @@ export function adaptiveBatchK(lastTrial: number | null, defaultK: number): numb
   return 8;
 }
 
+/**
+ * G6C.3 global trial index from a batch's local selection (pure; unit-tested).
+ * trialsBefore is the sum of ALL earlier batch widths (NOT batchIndex * width:
+ * that identity only holds for uniform widths). The device-side commit_arm
+ * tracks the same cumulative base in newtonCtl[7] for the identical reason.
+ */
+export function globalTrialIndex(trialsBefore: number, localIndex: number): number {
+  return trialsBefore + localIndex;
+}
+
 /** G6C.2 compact Newton-round status (one 80 B read per round). */
 export interface NewtonRoundStatus {
   iteration: number;
@@ -449,14 +459,19 @@ export class DeviceNewtonDriver {
   /** G6C.1 indexed sort: identical Batcher network, zero per-pass CPU
    *  uniforms. The cursor/triples walk the same (k,j) sequence the legacy
    *  loop would issue (see bitonicPassAt); all T sub-passes stay in flight
-   *  with no added submits. sortParams uploaded once per scene. */
+   *  with no added submits. sortParams uploaded once per scene. The cursor
+   *  reset is itself a GPU pass (no control-write flush); lane 1 carries T
+   *  so a stray step clamps instead of reading out of bounds. */
   sortPassesIndexed(): void {
     const m = this.c.m;
     const P = nextPow2(Math.max(m, 1));
     const stages = Math.log2(P);
     const T = (stages * (stages + 1)) / 2;
-    // Cursor reset (one control write before the batch opens work).
-    this.ex.writeBuffer("sortCursor", new Uint32Array([0, 0, 0, 0]));
+    this.ex.runPass({
+      shader: "broadphase-sort", entry: "sort_reset",
+      groups: [[B(6, "sortCursor")]],
+      x: 1,
+    });
     for (let t = 0; t < T; t++) {
       this.ex.runPass({
         shader: "broadphase-sort", entry: "sort_next",
@@ -1812,7 +1827,23 @@ export class DeviceNewtonDriver {
   /** G6B sync-free trial rebuild (Batch A + Batch B encode, no submit, no
    *  reads): refreshes records/gradient/rhs at the current xTrial for commit.
    *  Cap-bounded (contactCount uniform stays at cap); sentinel-cleared tail
-   *  slots are inert by the barrier/friction guards. */
+   *  slots are inert by the barrier/friction guards.
+   *
+   *  S1 (round-boundary sync): the clear is STRUCTURAL here, not caller
+   *  hygiene. Traverse/expand/compact append via atomics onto the live
+   *  counters; without a clear the rebuild appends the commit state's records
+   *  AFTER the last candidate trial's records (count doubles), and the
+   *  cap-bounded force/friction assembly then mixes two states into the
+   *  gradient that the next round's rhsJacobi reads. Clearing first makes the
+   *  post-commit buffers describe xTrial — and after the predicated copy,
+   *  position — by construction.
+   *
+   *  Precondition: simParams.contactCount must be cap here (both commit paths
+   *  hold it: the G6B batch prologue and the GPU-control step prologue set
+   *  cap-bounded loops, restored to the live count only by the next
+   *  evaluateNewtonState). The record clear is bounded by that uniform, so a
+   *  live count would leave stale tail slots that cap-bounded force/friction
+   *  assembly still reads. */
   rebuildTrialPasses(
     mat: { c00: number; c11: number; c01: number; g: number; thickness: number },
     contact: {
@@ -1820,6 +1851,7 @@ export class DeviceNewtonDriver {
       floorY: number; floorOn: number; dMin: number; contactCapacity: number;
     },
   ): void {
+    this.armijoClearPass();
     this.broadphasePasses(0.002, true);
     this.contactPasses(contact, "xTrial");
     this.femPasses(mat, true);
@@ -1890,9 +1922,13 @@ export class DeviceNewtonDriver {
     this.bankF(GpuUniformSlot.ArmijoPcgBd, opts.pcgBreakdown ? 1 : 0);
     this.bankF(GpuUniformSlot.ArmijoNewtonConv, opts.newtonConverged ? 1 : 0);
     this.resetMarker(opts.evalIndexBase + 1);
+    this.ex.pushValidationScope();
     this.ex.beginBatch("armijo-batch");
     this.armijoBatchPasses(K, opts.mat, opts.contact, opts.evalIndexBase);
     await this.ex.submitBatch(false);
+    // Validation gate BEFORE the status read: a poisoned batch must throw
+    // here rather than decode a stale/zero status as convergence/reject.
+    await this.ex.popValidationScope("armijo-batch");
     // THE one status readback per batch (labeled SYNC POINT).
     const raw = await this.ex.readSmall("armijoStatus", 64, "armijo-status", "status");
     return decodeArmijoStatus(raw);
@@ -1938,6 +1974,8 @@ export class DeviceNewtonDriver {
     const nst = new Float32Array(20);
     nst[0] = opts.round;
     this.ex.writeBuffer("newtonStatus", nst);
+    // Validation scope for the whole round (popped before the status read).
+    this.ex.pushValidationScope();
     this.ex.beginBatch("newton-round");
     // 1. Xk refresh at the accepted position (records current post-commit;
     //    round 0 reuses the E0 evaluation's records the same way).
@@ -2025,8 +2063,11 @@ export class DeviceNewtonDriver {
       ]],
       x: this.w(this.n3),
     });
-    // 7. B Armijo batches with predicated commit (per-batch CPU param writes
-    //    flush only — no syncs; the loop always runs all slots (bounded)).
+    // 7. B Armijo batches with first-accept arbitration (per-batch CPU param
+    //    writes flush only — no syncs; the loop always runs all slots
+    //    (bounded)). Commit happens ONCE after the loop (see below), so
+    //    position never advances mid-round and later batches evaluate from
+    //    the round-start state exactly like the sequential solver.
     let trialBase = 0;
     for (let b = 0; b < opts.batchKs.length; b++) {
       const K = opts.batchKs[b];
@@ -2044,7 +2085,7 @@ export class DeviceNewtonDriver {
         this.armijoTrialPasses(j, opts.mat, opts.contact, opts.evalIndexBase + trialBase + j);
       }
       this.armijoSelectPass();
-      // commit arbitration + refresh + predicated commit
+      // First-accept arbitration only (no commit yet — see step 7b).
       this.ex.runPass({
         shader: "newton-control", entry: "commit_arm",
         groups: [[
@@ -2054,36 +2095,41 @@ export class DeviceNewtonDriver {
         ]],
         x: 1,
       });
-      // Commit refresh: re-materialize xTrial at the latched alpha, rebuild
-      // records there, then predicated copy. (Without the re-apply, xTrial
-      // would still hold the last candidate — not necessarily accepted.)
-      this.ex.runPass({
-        shader: "newton-control", entry: "commit_apply",
-        groups: [[
-          B(64, "position"), B(65, "searchDirection"), B(66, "xTrial"),
-          B(67, "pinMask"), B(68, "pinPos"), B(69, "newtonCtl"),
-        ]],
-        x: this.w(this.c.n),
-      });
-      this.rebuildTrialPasses(opts.mat, opts.contact);
-      this.ex.runPass({
-        shader: "newton-control", entry: "commit_copy_if",
-        groups: [[
-          B(60, "xTrial"), B(61, "position"), B(62, "newtonCtl"),
-          B(63, "simParams"),
-        ]],
-        x: this.w(this.c.nExt),
-      });
-      this.ex.runPass({
-        shader: "newton-control", entry: "commit_lagged_if",
-        groups: [[
-          B(70, "contactN"), B(71, "contactDist"), B(72, "contactPrm"),
-          B(73, "laggedN"), B(74, "newtonCtl"), B(75, "simParams"),
-        ]],
-        x: this.w(Math.max(this.c.cap, 1)),
-      });
       trialBase += K;
     }
+    // 7b. Single end-of-round commit: re-materialize xTrial at the latched
+    // alpha, rebuild records there, then predicated copy. Position moves at
+    // most once per round, so records stay in sync with position by
+    // construction (S1: the old per-batch commit desynced them on
+    // accept-then-reject).
+    this.ex.runPass({
+      shader: "newton-control", entry: "commit_apply",
+      groups: [[
+        B(64, "position"), B(65, "searchDirection"), B(66, "xTrial"),
+        B(67, "pinMask"), B(68, "pinPos"), B(69, "newtonCtl"),
+      ]],
+      x: this.w(this.c.n),
+    });
+    this.rebuildTrialPasses(opts.mat, opts.contact);
+    this.ex.runPass({
+      shader: "newton-control", entry: "commit_copy_if",
+      groups: [[
+        B(60, "xTrial"), B(61, "position"), B(62, "newtonCtl"),
+        B(63, "simParams"),
+      ]],
+      x: this.w(this.c.nExt),
+    });
+    this.ex.runPass({
+      shader: "newton-control", entry: "commit_lagged_if",
+      groups: [[
+        B(70, "contactN"), B(71, "contactDist"), B(72, "contactPrm"),
+        B(73, "laggedN"), B(74, "newtonCtl"), B(75, "simParams"),
+      ]],
+      x: this.w(Math.max(this.c.cap, 1)),
+    });
+    // Marker evidence per round (1 pass + the bankU flush, no syncs): without
+    // this, marks accumulated inside the round would never reach execMarker.
+    this.flushMarks();
     // 8. Round report + the single status readback per round.
     this.ex.runPass({
       shader: "newton-control", entry: "round_report",
@@ -2094,6 +2140,9 @@ export class DeviceNewtonDriver {
       x: 1,
     });
     await this.ex.submitBatch(false);
+    // Validation gate BEFORE the status read: a poisoned round must throw
+    // here rather than decode a stale/zero status as convergence/failure.
+    await this.ex.popValidationScope("newton-round");
     const raw = await this.ex.readSmall("newtonStatus", 80, "newton-status", "status");
     return decodeNewtonStatus(raw);
   }

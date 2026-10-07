@@ -45,7 +45,8 @@ import { buildCoarsePattern, type CoarsePattern } from "../../solver/coarse-csr.
 import { bitonicPassAt } from "./gpu-broadphase.js";
 import { COARSE_MAX_DEGREE } from "./gpu-buffers.js";
 import {
-  applyPreconditionerMode, type PreconditionerMode, type PreconditionerFallback,
+  applyPreconditionerMode, adaptiveBatchK, globalTrialIndex,
+  type PreconditionerMode, type PreconditionerFallback,
 } from "./gpu-newton.js";
 
 /** G6A per-step production report: separates fixed-state solver evidence
@@ -558,6 +559,7 @@ export class WebGpuSolver implements ClothSolver {
     }
     // G6C.1 indexed-sort static table: (P, stage, sub, 0) per sub-pass t
     // (depends only on mesh size; uploaded once, read by sort_step_indexed).
+    // sortCursor lane 1 carries T so steps can clamp defensively.
     {
       const P2 = nextPow2(Math.max(scene.mesh.triCount, 1));
       const stages = Math.log2(P2);
@@ -571,7 +573,7 @@ export class WebGpuSolver implements ClothSolver {
         table[t * 4 + 3] = 0;
       }
       put("sortParams", table);
-      put("sortCursor", new Uint32Array([0, 0, 0, 0]));
+      put("sortCursor", new Uint32Array([0, T, 0, 0]));
     }
     // exclusion keys as (lo,hi) vec2u pairs (G2 encoding, uploaded once)
     {
@@ -912,11 +914,15 @@ export class WebGpuSolver implements ClothSolver {
           pcgBreakdown: 0,
           converged: 0,
         };
-        lastTrial = trialsUsed - K + st.selectedIndex;
+        lastTrial = globalTrialIndex(trialsUsed - K, st.selectedIndex);
+        // G6C.3 history feed (same semantics as the GPU-control path: global
+        // accepted trial index, -1 when the search exhausts the budget).
+        this.trialHistory.push(globalTrialIndex(trialsUsed - K, st.selectedIndex));
         return { alpha: st.selectedAlpha / opts.trustScale, accepted: true, status };
       }
       alphaBase *= Math.pow(0.5, adv);
     }
+    this.trialHistory.push(-1);
     return { alpha: alphaBase, accepted: false, status: null };
   }
 
@@ -932,10 +938,17 @@ export class WebGpuSolver implements ClothSolver {
     this.pushSimParams();
   }
 
-  /** G6C.2 batch-width schedule for one Newton round (static unroll). */
+  /** Batch-width schedule for one Newton round (static unroll). With
+   *  adaptiveK, the width follows the step's trial history (cold start uses
+   *  the configured default); otherwise the fixed armijoBatchK. */
   private batchKsFor(): number[] {
     const driver = this.driver!;
-    const K0 = Math.max(1, Math.min(8, driver.cfg.armijoBatchK));
+    const last = this.trialHistory.length > 0
+      ? this.trialHistory[this.trialHistory.length - 1]
+      : null;
+    const K0 = driver.cfg.adaptiveK
+      ? adaptiveBatchK(last, driver.cfg.armijoBatchK)
+      : Math.max(1, Math.min(8, driver.cfg.armijoBatchK));
     const Ks: number[] = [];
     let rem = driver.cfg.armijoIters;
     while (rem > 0) {
@@ -982,7 +995,6 @@ export class WebGpuSolver implements ClothSolver {
     if (evStatus.gradNorm < cfg.gradTol) {
       converged = true;
     } else {
-      const batchKs = this.batchKsFor();
       for (let k = 0; k < newtonIters; k++) {
         newtonItersUsed++;
         const submitsNewton0 = ex.ledger.submits;
@@ -991,6 +1003,9 @@ export class WebGpuSolver implements ClothSolver {
         const nst = new Float32Array(20);
         nst[0] = k;
         ex.writeBuffer("newtonStatus", nst);
+        // G6C.3 adaptive widths are re-predicted every round from the step's
+        // trial history (no syncs: history rides the per-round status read).
+        const batchKs = this.batchKsFor();
         const st = await driver.newtonRound({
           round: k,
           beta: this.jacobiBeta(),
@@ -1227,10 +1242,13 @@ export class WebGpuSolver implements ClothSolver {
             this.lastDeviceStatus = { ...s, directionDotGradient: gtdx };
             this.lastMarker = { mask: tev.markerMask, count: tev.markerCount };
             accepted = true;
+            // G6C.3 history feed (same semantics as batched/GPU paths).
+            this.trialHistory.push(li);
             break;
           }
           alpha *= 0.5;
         }
+        if (!accepted) this.trialHistory.push(-1);
       }
       submitsPerNewton.push(ex.ledger.submits - submitsNewton0);
       statusReadbacksPerNewton.push(this.hotLoopReadbacks - syncsNewton0);
