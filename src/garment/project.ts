@@ -51,6 +51,11 @@ export interface SimulationConfig {
   contact: ContactParams;
   /** World-space floor height, or null for no floor. */
   floorY: number | null;
+  /**
+   * Interior cloth mesh density target (metres, null = boundary
+   * triangulation untouched). Set for garments meant to drape.
+   */
+  meshMaxEdgeM: number | null;
 }
 
 export interface GarmentProject {
@@ -98,6 +103,7 @@ export function defaultSimulationConfig(): SimulationConfig {
     arealDensityKgM2: 0.15,
     contact: { ...DEFAULT_CONTACT_PARAMS },
     floorY: null,
+    meshMaxEdgeM: null,
   };
 }
 
@@ -226,6 +232,16 @@ export function validateGarmentProject(project: GarmentProject): ProjectValidati
     if (!Array.isArray(p.translation) || p.translation.length !== 3 || !p.translation.every(finiteNumber) || !finiteNumber(p.yawRad)) {
       push("invalid-placement", `placement for panel '${p.panelId}' is non-finite`, p.panelId);
     }
+    const wrap = (p as { wrap?: unknown }).wrap;
+    if (wrap !== undefined && wrap !== null) {
+      const w = wrap as { center?: unknown; radiusM?: unknown; facingRad?: unknown; refLx?: unknown; mirror?: unknown };
+      const centerOk = Array.isArray(w.center) && w.center.length === 2 && w.center.every(finiteNumber);
+      if (!centerOk || !finiteNumber(w.radiusM) || !(w.radiusM as number > 0) ||
+        !finiteNumber(w.facingRad) || !finiteNumber(w.refLx) ||
+        (w.mirror !== undefined && w.mirror !== null && typeof w.mirror !== "boolean")) {
+        push("invalid-placement", `placement wrap for panel '${p.panelId}' must have finite center/facing/refLx, positive radiusM, boolean mirror`, p.panelId);
+      }
+    }
   }
 
   // Avatar.
@@ -253,6 +269,10 @@ export function validateGarmentProject(project: GarmentProject): ProjectValidati
     }
     if (sim.floorY !== null && sim.floorY !== undefined && !finiteNumber(sim.floorY)) {
       push("invalid-simulation-config", "simulation floorY must be finite or null");
+    }
+    if (sim.meshMaxEdgeM !== null && sim.meshMaxEdgeM !== undefined &&
+      (!finiteNumber(sim.meshMaxEdgeM) || !(sim.meshMaxEdgeM > 0))) {
+      push("invalid-simulation-config", "simulation meshMaxEdgeM must be a positive length or null");
     }
   }
 
@@ -318,6 +338,9 @@ export function rebuildGarment(
   const assembled = assembleGarment(project.pattern, project.seams, project.placements, {
     ...assembleOpts,
     avatar: assembleOpts.avatar !== undefined ? assembleOpts.avatar : project.avatar,
+    interiorMaxEdgeM: assembleOpts.interiorMaxEdgeM !== undefined
+      ? assembleOpts.interiorMaxEdgeM
+      : (project.simulation.meshMaxEdgeM ?? undefined),
   });
   const fitting = createFittingScene(assembled, {
     material,

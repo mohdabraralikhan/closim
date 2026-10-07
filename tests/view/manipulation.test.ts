@@ -99,12 +99,15 @@ describe("pin manager", () => {
     const record = pins.create(3);
     expect(record.id).toBe("pin/1");
     expect(record.garmentEpoch).toBe(1);
-    pins.updateTarget("pin/1", [5, 5, 5]);
+    // Hard yank (half a metre on a ~2.5 cm mesh) — the pin must still hold
+    // the vertex exactly through a solver step without blowing up.
+    const yanked: [number, number, number] = [0.6, 1.1, 0.5];
+    pins.updateTarget("pin/1", yanked);
     session.stepOnce(1);
     const positions = solver.getPositions();
-    expect(positions[9]).toBe(5);
-    expect(positions[10]).toBe(5);
-    expect(positions[11]).toBe(5);
+    expect(positions[9]).toBe(yanked[0]);
+    expect(positions[10]).toBe(yanked[1]);
+    expect(positions[11]).toBe(yanked[2]);
     expect(pins.remove("pin/1")).toBe(true);
     expect(pins.remove("pin/1")).toBe(false);
   });

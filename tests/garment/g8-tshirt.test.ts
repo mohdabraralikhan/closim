@@ -45,7 +45,8 @@ describe("G8 final integration — T-shirt workflow", () => {
     // Assemble in 3D + place on avatar + simulate.
     const first = rebuildGarment(opened);
     expect(first.assembled.components).toHaveLength(1);
-    expect(first.assembled.weldPairs).toHaveLength(31);
+    // 3+3 shoulders, 9+9 sides, 5+5 sleeve caps across 6 seams.
+    expect(first.assembled.weldPairs).toHaveLength(34);
     const solverA = new CpuSolver();
     const fitA = runFitting(first.assembled, first.fitting, solverA, opened.avatar, {
       dt: opened.simulation.dt,
@@ -56,8 +57,11 @@ describe("G8 final integration — T-shirt workflow", () => {
     expect(fitA.hasNaNInf).toBe(false);
     const positionsA = Array.from(solverA.getPositions());
 
-    // Inspect fit: garment drapes (moves) but stays finite and clear of NaN.
-    expect(fitA.finalMaxDisplacementM).toBeGreaterThan(0);
+    // Inspect fit: the project starts pre-draped (isometric wrap), so the
+    // garment must stay settled in resting contact instead of drifting.
+    expect(fitA.finalMaxDisplacementM).toBeLessThan(0.05);
+    expect(fitA.finalMinAvatarDistanceM).not.toBeNull();
+    expect(fitA.finalMinAvatarDistanceM as number).toBeLessThan(0.02);
 
     // Modify pattern in 2D: lengthen the front panel by 3 cm.
     const frontPanelId = opened.pattern.panels[0].id;

@@ -12,14 +12,13 @@ import type { GarmentWorkspace } from "../src/view/viewport.js";
 import type { OrbitCamera } from "../src/view/camera.js";
 import { WorkspaceError } from "../src/view/types.js";
 
-const COL_BASE_A = new THREE.Color(0x6f9fc8);
-const COL_BASE_B = new THREE.Color(0x5d8ab2);
+const COL_FABRIC = new THREE.Color(0xe8e0d0);
 const COL_HIGHLIGHT = new THREE.Color(0xffc04d);
 const COL_SEAM = 0xffd27a;
 const COL_SEAM_SELECTED = 0xff8c42;
 const COL_BOUNDARY = 0xd8dde4;
 const COL_BOUNDARY_SELECTED = 0xffc04d;
-const COL_AVATAR = 0x495057;
+const COL_AVATAR = 0x9aa0a8;
 const COL_HEAT_OK = new THREE.Color(0x2f9e44);
 const COL_HEAT_NEAR = new THREE.Color(0xf59f00);
 const COL_HEAT_INSIDE = new THREE.Color(0xe03131);
@@ -60,7 +59,7 @@ export class ViewportRenderer {
 
   private garmentGeometry: THREE.BufferGeometry | null = null;
   private garmentMesh: THREE.Mesh | null = null;
-  private garmentMaterial: THREE.MeshLambertMaterial;
+  private garmentMaterial: THREE.MeshStandardMaterial;
   private positionAttribute: THREE.BufferAttribute | null = null;
   private colorAttribute: THREE.BufferAttribute | null = null;
 
@@ -81,6 +80,8 @@ export class ViewportRenderer {
   constructor(canvas: HTMLCanvasElement) {
     this.three = new THREE.WebGLRenderer({ canvas, antialias: true });
     this.three.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    this.three.shadowMap.enabled = true;
+    this.three.shadowMap.type = THREE.PCFSoftShadowMap;
     this.scene.background = new THREE.Color(0x20242a);
 
     const hemi = new THREE.HemisphereLight(0xcfd8e3, 0x30343b, 0.9);
@@ -88,6 +89,15 @@ export class ViewportRenderer {
     this.scene.add(hemi);
     const dir = new THREE.DirectionalLight(0xffffff, 1.1);
     dir.position.set(1.5, 3, 2);
+    dir.castShadow = true;
+    dir.shadow.mapSize.set(2048, 2048);
+    dir.shadow.camera.left = -1.5;
+    dir.shadow.camera.right = 1.5;
+    dir.shadow.camera.top = 2;
+    dir.shadow.camera.bottom = -0.5;
+    dir.shadow.camera.near = 0.5;
+    dir.shadow.camera.far = 8;
+    dir.shadow.bias = -0.0002;
     this.scene.add(dir);
     const dir2 = new THREE.DirectionalLight(0x8899aa, 0.4);
     dir2.position.set(-2, 1, -1.5);
@@ -97,11 +107,23 @@ export class ViewportRenderer {
     (this.grid.material as THREE.Material).transparent = true;
     (this.grid.material as THREE.Material).opacity = 0.6;
     this.scene.add(this.grid);
+    // Shadow-catcher ground just under the grid (avoids z-fighting).
+    const ground = new THREE.Mesh(
+      new THREE.CircleGeometry(3, 48),
+      new THREE.ShadowMaterial({ opacity: 0.32 }),
+    );
+    ground.rotation.x = -Math.PI / 2;
+    ground.position.y = -0.001;
+    ground.receiveShadow = true;
+    this.scene.add(ground);
     this.scene.add(this.seamGroup);
     this.scene.add(this.pinGroup);
 
-    this.garmentMaterial = new THREE.MeshLambertMaterial({
+    this.garmentMaterial = new THREE.MeshStandardMaterial({
       vertexColors: true,
+      color: COL_FABRIC,
+      roughness: 0.85,
+      metalness: 0,
       side: THREE.DoubleSide,
     });
   }
@@ -134,6 +156,8 @@ export class ViewportRenderer {
     this.colorAttribute = colorAttr;
     this.garmentMesh = new THREE.Mesh(geometry, this.garmentMaterial);
     this.garmentMesh.frustumCulled = false;
+    this.garmentMesh.castShadow = true;
+    this.garmentMesh.receiveShadow = true;
     this.scene.add(this.garmentMesh);
     this.updateColors(ws);
 
@@ -143,7 +167,14 @@ export class ViewportRenderer {
       avatarGeometry.setAttribute("position", new THREE.BufferAttribute(Float32Array.from(avatar.positions), 3));
       avatarGeometry.setIndex(new THREE.BufferAttribute(Uint32Array.from(avatar.indices), 1));
       avatarGeometry.computeVertexNormals();
-      this.avatarMesh = new THREE.Mesh(avatarGeometry, new THREE.MeshLambertMaterial({ color: COL_AVATAR, side: THREE.DoubleSide }));
+      this.avatarMesh = new THREE.Mesh(avatarGeometry, new THREE.MeshStandardMaterial({
+        color: COL_AVATAR,
+        roughness: 0.55,
+        metalness: 0,
+        side: THREE.DoubleSide,
+      }));
+      this.avatarMesh.castShadow = true;
+      this.avatarMesh.receiveShadow = true;
       this.scene.add(this.avatarMesh);
     }
 
@@ -275,13 +306,11 @@ export class ViewportRenderer {
         colors[v * 3] = c.r; colors[v * 3 + 1] = c.g; colors[v * 3 + 2] = c.b;
       }
     } else {
-      const panelTint = new Map<string, THREE.Color>();
-      assembled.panelRanges.forEach((_, i) => {
-        panelTint.set(assembled.panelRanges[i].panelId, i % 2 === 0 ? COL_BASE_A : COL_BASE_B);
-      });
+      // Single neutral fabric tone; selection is the only tint. The panel
+      // index zebra striping is gone on purpose: it read as toy plastic.
+      const white = new THREE.Color(0xffffff);
       for (let v = 0; v < n; v++) {
-        const panelId = assembled.vertexPanelIds[v];
-        const c = ws.selection.panelIds.includes(panelId) ? COL_HIGHLIGHT : panelTint.get(panelId) ?? COL_BASE_A;
+        const c = ws.selection.panelIds.includes(assembled.vertexPanelIds[v]) ? COL_HIGHLIGHT : white;
         colors[v * 3] = c.r; colors[v * 3 + 1] = c.g; colors[v * 3 + 2] = c.b;
       }
     }

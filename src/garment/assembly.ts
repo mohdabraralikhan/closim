@@ -32,6 +32,7 @@ import {
   triangulateCadPanel,
   type PatternDocument,
 } from "../pattern/cad.js";
+import { subdivideTriangulation } from "../pattern/pattern-geometry.js";
 import {
   resolveStitchPairs,
   validateSeams,
@@ -51,6 +52,33 @@ export interface PanelPlacement {
   translation: Vec3;
   /** Yaw about the world Y axis in radians (deterministic spin). */
   yawRad: number;
+  /**
+   * Optional cylindrical pre-drape: wraps the panel (isometrically, in
+   * pattern-x) around a vertical world axis instead of the rigid
+   * translation+yaw above. translation[1] still sets the base height;
+   * translation[0]/[2] and yawRad are ignored when wrap is present.
+   * Arc-length preserving, so the rest metric is undistorted and the
+   * solver starts settled rather than exploding.
+   */
+  wrap?: CylinderWrap | null;
+}
+
+/** Arc-length-preserving cylindrical wrap around a vertical world axis. */
+export interface CylinderWrap {
+  /** World XZ point the cylinder axis passes through. */
+  center: [number, number];
+  /** Cylinder radius in metres. Must be > 0. */
+  radiusM: number;
+  /** World angle (x = cx + R sin, z = cz + R cos) at pattern-x = refLx. */
+  facingRad: number;
+  /** Pattern-x (post authoring transform) mapped to facingRad. */
+  refLx: number;
+  /**
+   * Mirror the wrap direction (angle decreases with pattern-x). Needed when
+   * the mating panel runs the opposite way around the cylinder, e.g. a back
+   * panel whose left edge must land on the same body side as the front's.
+   */
+  mirror?: boolean | null;
 }
 
 export interface AssembleOptions {
@@ -62,6 +90,13 @@ export interface AssembleOptions {
   deepPenetrationM?: number;
   /** Avatar used for placement diagnostics. Null = skip collision checks. */
   avatar?: AvatarSpec | null;
+  /**
+   * Interior mesh density target (metres): triangulated panels are
+   * longest-edge subdivided until no edge exceeds this length, so coarse
+   * boundary-only triangulations can drape in the solver. Undefined/null =
+   * keep boundary triangulation untouched (existing behavior).
+   */
+  interiorMaxEdgeM?: number | null;
 }
 
 export type AssemblyDiagnosticCode =
@@ -138,6 +173,16 @@ export function panelPointToWorld(
   const panel = document.panels.find((p) => p.id === panelId);
   if (!panel) throw new Error(`assembly: panel '${panelId}' does not exist`);
   const flat = localToGlobal(panel, local);
+  const wrap = placement.wrap;
+  if (wrap) {
+    const dir = wrap.mirror ? -1 : 1;
+    const theta = wrap.facingRad + dir * ((flat[0] - wrap.refLx) / wrap.radiusM);
+    return [
+      wrap.center[0] + wrap.radiusM * Math.sin(theta),
+      placement.translation[1] + flat[1],
+      wrap.center[1] + wrap.radiusM * Math.cos(theta),
+    ];
+  }
   const c = Math.cos(placement.yawRad), s = Math.sin(placement.yawRad);
   // Pattern plane (x, y, 0) spun about Y: world = Ry(yaw) * (lx, ly, 0) + t.
   return [
@@ -212,6 +257,15 @@ export function assembleGarment(
     } catch (error) {
       push("triangulation-failed", `panel '${panel.id}' failed to triangulate: ${error instanceof Error ? error.message : String(error)}`, panel.id);
       continue;
+    }
+    if (opts.interiorMaxEdgeM !== undefined && opts.interiorMaxEdgeM !== null) {
+      try {
+        const dense = subdivideTriangulation(tri.vertices, tri.triangles, opts.interiorMaxEdgeM);
+        tri = { ...tri, vertices: dense.vertices, triangles: dense.triangles };
+      } catch (error) {
+        push("triangulation-failed", `panel '${panel.id}' densification failed: ${error instanceof Error ? error.message : String(error)}`, panel.id);
+        continue;
+      }
     }
     const n = tri.vertices.length / 2;
     const base = pos.length / 3;

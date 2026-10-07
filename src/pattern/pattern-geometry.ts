@@ -860,3 +860,81 @@ export function triangulatedFromJSON(json: string): TriangulatedPanel {
     materialId: String(p.materialId),
   };
 }
+
+// ---------------------------------------------------------------------------
+// Interior densification (deterministic longest-edge subdivision)
+// ---------------------------------------------------------------------------
+
+/**
+ * Split triangulation edges longer than `maxEdgeM` until every edge is
+ * within the limit. New vertices are edge midpoints, so straight boundary
+ * edges stay exact and the rest metric is unchanged (midpoints inherit the
+ * surrounding plane). Deterministic: single longest-edge scan per split in
+ * stored triangle/edge order with first-found tie-break; no randomness.
+ *
+ * Intended for cloth panels: boundary-only triangulations (e.g. 2 tris for
+ * a rectangle) cannot drape. Densifying in pattern space keeps UV/rest
+ * coordinates consistent for the weld-snapping stage downstream.
+ */
+export function subdivideTriangulation(
+  vertices: Float64Array,
+  triangles: Uint32Array,
+  maxEdgeM: number,
+  maxSplits = 200000,
+): { vertices: Float64Array; triangles: Uint32Array } {
+  if (!(maxEdgeM > 0) || !Number.isFinite(maxEdgeM)) {
+    throw new PatternError("invalid-density", "subdivision maxEdgeM must be a positive finite length");
+  }
+  const vx: number[] = Array.from(vertices);
+  let tri: number[] = Array.from(triangles);
+  const limit2 = maxEdgeM * maxEdgeM;
+  let splits = 0;
+  for (;;) {
+    let bestLen2 = limit2;
+    let bestA = -1, bestB = -1;
+    const triCount = tri.length / 3;
+    for (let t = 0; t < triCount; t++) {
+      for (let e = 0; e < 3; e++) {
+        const a = tri[t * 3 + e];
+        const b = tri[t * 3 + ((e + 1) % 3)];
+        const dx = vx[a * 2] - vx[b * 2];
+        const dy = vx[a * 2 + 1] - vx[b * 2 + 1];
+        const l2 = dx * dx + dy * dy;
+        if (l2 > bestLen2) {
+          bestLen2 = l2;
+          bestA = a;
+          bestB = b;
+        }
+      }
+    }
+    if (bestA < 0) break;
+    splits++;
+    if (splits > maxSplits) {
+      throw new PatternError("density-runaway", `subdivision exceeded ${maxSplits} splits for maxEdgeM=${maxEdgeM}`);
+    }
+    const m = vx.length / 2;
+    vx.push((vx[bestA * 2] + vx[bestB * 2]) / 2, (vx[bestA * 2 + 1] + vx[bestB * 2 + 1]) / 2);
+    const next: number[] = [];
+    for (let t = 0; t < tri.length; t += 3) {
+      const p = [tri[t], tri[t + 1], tri[t + 2]];
+      let edgePos = -1;
+      for (let e = 0; e < 3; e++) {
+        const u = p[e], v = p[(e + 1) % 3];
+        if ((u === bestA && v === bestB) || (u === bestB && v === bestA)) {
+          edgePos = e;
+          break;
+        }
+      }
+      if (edgePos < 0) {
+        next.push(p[0], p[1], p[2]);
+        continue;
+      }
+      const first = p[edgePos];
+      const second = p[(edgePos + 1) % 3];
+      const c = p[(edgePos + 2) % 3];
+      next.push(first, m, c, m, second, c);
+    }
+    tri = next;
+  }
+  return { vertices: Float64Array.from(vx), triangles: Uint32Array.from(tri) };
+}

@@ -684,7 +684,13 @@ function frame(now: number): void {
   const dt = Math.min((now - lastFrameTime) / 1000, 0.1);
   lastFrameTime = now;
 
-  session.tick(dt);
+  // A solver blow-up must pause with a message, never kill the loop.
+  try {
+    session.tick(dt);
+  } catch (error) {
+    session.pause();
+    statusMessage = error instanceof Error ? `sim halted: ${error.message}` : `sim halted: ${String(error)}`;
+  }
   renderer.sync(workspace);
   renderer.updatePins(pins);
   renderer.render(workspace);

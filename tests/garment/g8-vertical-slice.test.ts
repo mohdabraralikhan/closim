@@ -117,8 +117,8 @@ describe("G8E vertical slice", () => {
   it("Case 4 — shirt-like topology with multiple seams + avatar + simulation", () => {
     const { project } = buildTshirtProject();
     const { assembled, fitting } = rebuildGarment(project);
-    // 7+7+7+5+5 stitch pairs across 5 seams, one connected component.
-    expect(assembled.weldPairs).toHaveLength(31);
+    // 3+3 shoulders, 9+9 sides, 5+5 sleeve caps across 6 seams, one connected component.
+    expect(assembled.weldPairs).toHaveLength(34);
     expect(assembled.components).toHaveLength(1);
     expect(assembled.penetratingVertexCount).toBe(0);
     const solver = new CpuSolver();
@@ -341,6 +341,6 @@ describe("G8E adversarial cases", () => {
     // All seam panel/loop references still resolve after the edit.
     const { assembled } = rebuildGarment(edited);
     expect(assembled.diagnostics.filter((d) => d.code === "failed-seam-reference")).toEqual([]);
-    expect(assembled.weldPairs).toHaveLength(31);
+    expect(assembled.weldPairs).toHaveLength(34);
   });
 });
